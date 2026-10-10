@@ -1,0 +1,22 @@
+{
+  "name": "chat-ecc-backend",
+  "version": "1.0.0",
+  "description": "Backend para Chat E2EE com ECC",
+  "main": "server.js",
+  "scripts": {
+    "dev": "nodemon server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^4.22.3",
+    "socket.io": "^4.8.4"
+  },
+  "devDependencies": {
+    "nodemon": "^1.19.4"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}

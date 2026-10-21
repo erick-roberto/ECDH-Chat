@@ -1,22 +1,30 @@
+// caminho: backend/server.js
 const express = require('express');
 const http = require('http');
-const socketIO = require('socket.io');
-const socketHandler = require('./src/socket');
+const cors = require('cors');
+const { Server } = require('socket.io');
+const setupSocket = require('./src/socket');
+
+// Em produção, defina CORS_ORIGIN (ex.: https://meuchat.com). Em dev, aceita qualquer origem.
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: CORS_ORIGIN }));
+
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 const server = http.createServer(app);
-const io = new Server(server,{
+const io = new Server(server, {
     cors: {
-        origin: '*',
+        origin: CORS_ORIGIN,
         methods: ['GET', 'POST'],
-    }
+    },
+    maxHttpBufferSize: 1e6, // 1 MB por mensagem
 });
 
-socketHandler.setupdSocket(io);
+setupSocket(io);
 
-const Port = process.env.PORT || 3000;
-server.listen(Port, () => {
-    console.log('Server is running on port: ', Port);
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log('Server is running on port:', PORT);
 });

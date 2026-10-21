@@ -1,11 +1,12 @@
+
 const users = new Map();
 const publicKeys = new Map();
 const messageQueue = new Map();
 const groups = new Map();
 
-export default{
+module.exports = {
     users,
     publicKeys,
     messageQueue,
-    groups
-}
+    groups,
+};

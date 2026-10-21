@@ -8,9 +8,11 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "cors": "^2.8.6",
-    "express": "^4.22.3",
-    "socket.io": "^4.8.4"
+  "@noble/curves": "1.8.2",
+  "@noble/hashes": "1.7.1",
+  "cors": "^2.8.6",
+  "express": "^4.22.3",
+  "socket.io": "^4.8.4"
   },
   "devDependencies": {
     "nodemon": "^3.1.14",

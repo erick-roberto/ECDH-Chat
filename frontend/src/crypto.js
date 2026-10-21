@@ -35,8 +35,46 @@ function concat(...arrays) {
 function bytesToBigint(bytes) {
   return BigInt('0x' + bytesToHex(bytes));
 }
-function stablePacketBytes(packet) {
-  return new TextEncoder().encode(JSON.stringify(packet));
+
+// Serialização assinada: domínio + array de campos em ordem FIXA (não depende
+// da ordem das chaves de um objeto). O prefixo de domínio impede que uma
+// assinatura feita para um contexto (mensagem direta) valha em outro (grupo,
+// registro), já que a mesma chave de identidade assina tudo.
+const DIRECT_DOMAIN = 'chat-ecc/direct/v2';
+const GROUP_DOMAIN = 'chat-ecc/group/v2';
+const REGISTER_DOMAIN = 'chat-ecc/register/v1';
+const GROUP_GRANT_DOMAIN = 'chat-ecc/group-grant/v1';
+
+function signedBytes(domain, fields) {
+  return new TextEncoder().encode(`${domain}\n${JSON.stringify(fields)}`);
+}
+function signFields(domain, fields, privateKeyHex) {
+  return secp256k1
+    .sign(sha256(signedBytes(domain, fields)), hexToBytes(privateKeyHex))
+    .toCompactHex();
+}
+function verifyFields(domain, fields, signatureHex, publicKeyHex) {
+  try {
+    return secp256k1.verify(signatureHex, sha256(signedBytes(domain, fields)), publicKeyHex);
+  } catch {
+    return false;
+  }
+}
+
+// Identificador único (128 bits) da mensagem, via CSPRNG. Funciona também em
+// contextos não seguros (HTTP na rede local), onde crypto.randomUUID não existe.
+export function newMessageId() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return bytesToHex(bytes);
+}
+function checkEnvelope(packet) {
+  if (typeof packet.messageId !== 'string' || !/^[0-9a-f]{32}$/.test(packet.messageId)) {
+    throw new Error('messageId inválido.');
+  }
+  if (!Number.isSafeInteger(packet.sentAt) || packet.sentAt <= 0) {
+    throw new Error('sentAt inválido.');
+  }
 }
 function parsePublicKey(publicKeyHex) {
   try {
@@ -118,6 +156,17 @@ export function createIdentity() {
   return { privateKey, publicKey };
 }
 
+export const DIRECT_ALGORITHM = 'EC-ElGamal-secp256k1-direct-v2';
+export const GROUP_ALGORITHM = 'EC-ElGamal-secp256k1-group-v2';
+export const PROTOCOL_VERSION = 2;
+
+const directFields = p => [
+  p.version, p.algorithm, p.senderID, p.receiverID, p.messageId, p.sentAt, p.c1, p.c2
+];
+const groupFields = p => [
+  p.version, p.algorithm, p.groupID, p.senderID, p.receiverID, p.messageId, p.sentAt, p.c1, p.c2
+];
+
 export function encryptForRecipient(text, recipientPublicKey, senderPrivateKey, senderID, receiverID) {
   const recipientPoint = parsePublicKey(recipientPublicKey);
   const messagePoint = encodeMessagePoint(text);
@@ -125,56 +174,55 @@ export function encryptForRecipient(text, recipientPublicKey, senderPrivateKey, 
   const c1 = Point.BASE.multiply(ephemeral);
   const c2 = messagePoint.add(recipientPoint.multiply(ephemeral));
   const unsigned = {
-    version: 1,
-    algorithm: 'EC-ElGamal-secp256k1-demo',
+    version: PROTOCOL_VERSION,
+    algorithm: DIRECT_ALGORITHM,
     senderID,
     receiverID,
+    messageId: newMessageId(),
+    sentAt: Date.now(),
     c1: c1.toHex(true),
     c2: c2.toHex(true)
   };
-  const signature = secp256k1.sign(sha256(stablePacketBytes(unsigned)), hexToBytes(senderPrivateKey)).toCompactHex();
+  const signature = signFields(DIRECT_DOMAIN, directFields(unsigned), senderPrivateKey);
   return { ...unsigned, signature };
 }
 
-export function decryptAndVerify(packet, recipientPrivateKey, senderPublicKey) {
-  // Assina/verifica apenas os campos criptográficos imutáveis. O servidor adiciona
-  // `type` e `timestamp` ao rotear a mensagem, portanto esses campos não entram na assinatura.
-  const unsigned = {
-    version: packet.version,
-    algorithm: packet.algorithm,
-    senderID: packet.senderID,
-    receiverID: packet.receiverID,
-    c1: packet.c1,
-    c2: packet.c2
-  };
-  const verified = secp256k1.verify(
-    packet.signature,
-    sha256(stablePacketBytes(unsigned)),
-    senderPublicKey
-  );
-  if (!verified) throw new Error('Assinatura inválida. Mensagem descartada.');
+// Retorna { plaintext, messageId, sentAt }. A assinatura é verificada ANTES de decifrar.
+export function decryptAndVerify(packet, recipientPrivateKey, senderPublicKey, expectedUserID) {
+  if (!packet || packet.algorithm !== DIRECT_ALGORITHM) {
+    throw new Error('Algoritmo de mensagem direta desconhecido.');
+  }
+  if (packet.version !== PROTOCOL_VERSION) {
+    throw new Error('Versão do pacote não suportada.');
+  }
+  if (expectedUserID && packet.receiverID !== expectedUserID) {
+    throw new Error('A mensagem não foi destinada a este usuário.');
+  }
+  checkEnvelope(packet);
+  // `type` e `timestamp` são adicionados pelo servidor e ficam fora da assinatura.
+  if (!verifyFields(DIRECT_DOMAIN, directFields(packet), packet.signature, senderPublicKey)) {
+    throw new Error('Assinatura inválida. Mensagem descartada.');
+  }
   const d = BigInt('0x' + recipientPrivateKey);
   const c1 = Point.fromHex(packet.c1);
   const c2 = Point.fromHex(packet.c2);
   const messagePoint = c2.add(c1.multiply(d).negate());
-  return decodeMessagePoint(messagePoint);
+  return {
+    plaintext: decodeMessagePoint(messagePoint),
+    messageId: packet.messageId,
+    sentAt: packet.sentAt
+  };
 }
 
-const GROUP_ALGORITHM = 'EC-ElGamal-secp256k1-group-demo';
-
-export function encryptForGroup(
-  text,
-  groupID,
-  recipients,
-  senderPrivateKey,
-  senderID
-) {
+export function encryptForGroup(text, groupID, recipients, senderPrivateKey, senderID) {
   if (!Array.isArray(recipients) || recipients.length === 0) {
     throw new Error('O grupo não possui outros destinatários.');
   }
 
   const messagePoint = encodeMessagePoint(text);
   const ephemeral = randomScalar();
+  const messageId = newMessageId();
+  const sentAt = Date.now();
 
   // Um único C1 é compartilhado entre todos os destinatários.
   const c1 = Point.BASE.multiply(ephemeral).toHex(true);
@@ -189,31 +237,24 @@ export function encryptForGroup(
       const recipientPoint = parsePublicKey(recipient.publicKey);
 
       // C2 específico para a chave pública deste destinatário.
-      const c2 = messagePoint
-        .add(recipientPoint.multiply(ephemeral))
-        .toHex(true);
+      const c2 = messagePoint.add(recipientPoint.multiply(ephemeral)).toHex(true);
 
       const unsigned = {
-        version: 1,
+        version: PROTOCOL_VERSION,
         algorithm: GROUP_ALGORITHM,
         groupID,
         senderID,
         receiverID: recipient.username,
+        messageId,
+        sentAt,
         c1,
         c2,
       };
 
-      const signature = secp256k1
-        .sign(
-          sha256(stablePacketBytes(unsigned)),
-          hexToBytes(senderPrivateKey)
-        )
-        .toCompactHex();
-
       return {
         username: recipient.username,
         c2,
-        signature,
+        signature: signFields(GROUP_DOMAIN, groupFields(unsigned), senderPrivateKey),
       };
     });
 
@@ -222,53 +263,30 @@ export function encryptForGroup(
   }
 
   return {
-    version: 1,
+    version: PROTOCOL_VERSION,
     algorithm: GROUP_ALGORITHM,
     groupID,
     senderID,
+    messageId,
+    sentAt,
     c1,
     encryptedBlocks,
   };
 }
 
-export function decryptGroupAndVerify(
-  packet,
-  recipientPrivateKey,
-  senderPublicKey,
-  expectedUserID
-) {
+export function decryptGroupAndVerify(packet, recipientPrivateKey, senderPublicKey, expectedUserID) {
   if (!packet || packet.algorithm !== GROUP_ALGORITHM) {
     throw new Error('Algoritmo de mensagem de grupo desconhecido.');
   }
-
-  if (packet.version !== 1) {
+  if (packet.version !== PROTOCOL_VERSION) {
     throw new Error('Versão do pacote de grupo não suportada.');
   }
-
-  if (
-    expectedUserID &&
-    packet.receiverID !== expectedUserID
-  ) {
+  if (expectedUserID && packet.receiverID !== expectedUserID) {
     throw new Error('A mensagem não foi destinada a este usuário.');
   }
+  checkEnvelope(packet);
 
-  const unsigned = {
-    version: packet.version,
-    algorithm: packet.algorithm,
-    groupID: packet.groupID,
-    senderID: packet.senderID,
-    receiverID: packet.receiverID,
-    c1: packet.c1,
-    c2: packet.c2,
-  };
-
-  const verified = secp256k1.verify(
-    packet.signature,
-    sha256(stablePacketBytes(unsigned)),
-    senderPublicKey
-  );
-
-  if (!verified) {
+  if (!verifyFields(GROUP_DOMAIN, groupFields(packet), packet.signature, senderPublicKey)) {
     throw new Error('Assinatura do grupo inválida. Mensagem descartada.');
   }
 
@@ -279,7 +297,46 @@ export function decryptGroupAndVerify(
   // Pm = C2 - d*C1
   const messagePoint = c2.add(c1.multiply(privateScalar).negate());
 
-  return decodeMessagePoint(messagePoint);
+  return {
+    plaintext: decodeMessagePoint(messagePoint),
+    messageId: packet.messageId,
+    sentAt: packet.sentAt,
+  };
+}
+
+/* ---------- Autenticação de sessão (prova de posse da chave de identidade) ---------- */
+
+// O servidor envia um nonce de uso único; o cliente assina [userID, nonce].
+export function signRegistration(privateKeyHex, userID, nonce) {
+  return signFields(REGISTER_DOMAIN, [userID, nonce], privateKeyHex);
+}
+
+/* ---------- Concessão de grupo: o criador assina a lista de membros ---------- */
+// Impede que o servidor adicione/remova membros sem que os clientes percebam.
+
+export function newGroupID() {
+  return newMessageId();
+}
+const sortedMembers = members => [...new Set(members)].sort();
+
+export function signGroupGrant(privateKeyHex, groupID, members, createdBy) {
+  return signFields(GROUP_GRANT_DOMAIN, [groupID, sortedMembers(members), createdBy], privateKeyHex);
+}
+export function verifyGroupGrant(group, creatorPublicKey) {
+  if (!group?.signature) return false;
+  return verifyFields(
+    GROUP_GRANT_DOMAIN,
+    [group.groupID, sortedMembers(group.members), group.createdBy],
+    group.signature,
+    creatorPublicKey
+  );
+}
+
+/* ---------- Fingerprint para verificação fora de banda ---------- */
+
+export function fingerprint(publicKeyHex) {
+  const digest = bytesToHex(sha256(hexToBytes(publicKeyHex))).slice(0, 40);
+  return digest.match(/.{4}/g).join(' ');
 }
 
 export function validatePrivateKey(hex) {

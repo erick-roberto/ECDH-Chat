@@ -7,14 +7,31 @@ import {
   validatePrivateKey,
   encryptForGroup,
   decryptGroupAndVerify,
+  signRegistration,
+  newGroupID,
+  signGroupGrant,
+  verifyGroupGrant,
+  fingerprint,
 } from './crypto';
 import { createSocket, emitAck } from './socket';
+import { pinKey, alreadySeen } from './keyring';
 
-const STORAGE_KEY = 'ecdh-chat.identity.v1';
+const STORAGE_KEY = 'chat-ecc.identity.v2';
+const LEGACY_STORAGE_KEY = 'ecdh-chat.identity.v1';
 
 const readIdentity = () => {
   try {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+    const current = localStorage.getItem(STORAGE_KEY);
+    if (current) return JSON.parse(current);
+
+    // Migra a identidade da versão ECDH, se existir.
+    const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (legacy) {
+      localStorage.setItem(STORAGE_KEY, legacy);
+      localStorage.removeItem(LEGACY_STORAGE_KEY);
+      return JSON.parse(legacy);
+    }
+    return null;
   } catch {
     return null;
   }
@@ -192,11 +209,16 @@ export default function App() {
       handleIncomingGroup(packet);
     });
 
-    socket.on('your_groups', groupList => {
-      setGroups(Array.isArray(groupList) ? groupList : []);
+    socket.on('your_groups', async groupList => {
+      const accepted = [];
+      for (const group of Array.isArray(groupList) ? groupList : []) {
+        if (acceptGroup(group)) accepted.push(group);
+      }
+      setGroups(accepted);
     });
 
     socket.on('group_created', groupData => {
+      if (!acceptGroup(groupData)) return;
       setGroups(previous => [
         ...previous.filter(group => group.groupID !== groupData.groupID),
         groupData,
@@ -231,9 +253,18 @@ export default function App() {
       throw new Error('Informe um identificador de usuário.');
     }
 
+    // Prova de posse: o servidor envia um nonce de uso único e o cliente o
+    // assina com a chave privada de identidade (que nunca sai do dispositivo).
+    const challenge = await emitAck(socket, 'get_auth_challenge', {});
+
+    if (!challenge.success || !challenge.nonce) {
+      throw new Error('Não foi possível obter o desafio de autenticação.');
+    }
+
     const response = await emitAck(socket, 'register_public_key', {
       userID: normalizedID,
       publicKey: ident.publicKey,
+      signature: signRegistration(ident.privateKey, normalizedID, challenge.nonce),
     });
 
     if (!response.success) {
@@ -342,34 +373,78 @@ export default function App() {
     }
   }
 
+  // Busca a chave pública no servidor e a fixa (TOFU). Se a chave mudar, recusa.
+  async function getPeerKey(peerID) {
+    const key = await emitAck(socket, 'request_public_key', {
+      targetUserID: peerID,
+    });
+
+    if (!key.success) {
+      throw new Error(
+        key.message || 'Não foi possível obter a chave pública do usuário.'
+      );
+    }
+
+    if (pinKey(peerID, key.publicKey) === 'new') {
+      setNotice(
+        `Primeiro contato com "${peerID}". Confirme por outro canal que o fingerprint é: ${fingerprint(key.publicKey)}`
+      );
+    }
+
+    return key.publicKey;
+  }
+
+  // Valida uma concessão de grupo: assinatura do criador + chaves fixadas.
+  function acceptGroup(group) {
+    try {
+      const keys = group?.groupKeys;
+      if (!group || !Array.isArray(keys) || !Array.isArray(group.members)) {
+        return false;
+      }
+
+      const names = keys.map(item => item.username).sort().join('|');
+      if (names !== [...group.members].sort().join('|')) return false;
+
+      for (const item of keys) pinKey(item.username, item.publicKey);
+
+      const creatorKey = keys.find(item => item.username === group.createdBy)?.publicKey;
+      if (!creatorKey || !verifyGroupGrant(group, creatorKey)) {
+        setNotice('Grupo recusado: assinatura do criador inválida.');
+        return false;
+      }
+      return true;
+    } catch (error) {
+      setNotice(`Grupo recusado: ${error.message}`);
+      return false;
+    }
+  }
+
   async function handleIncoming(packet, queued = false) {
     try {
       const me = identityRef.current;
 
       if (!me || packet.receiverID !== me.userID) return;
 
-      const key = await emitAck(socket, 'request_public_key', {
-        targetUserID: packet.senderID,
-      });
+      const senderKey = await getPeerKey(packet.senderID);
 
-      if (!key.success) {
-        throw new Error('Não foi possível obter a chave pública do remetente.');
-      }
-
-      const plaintext = decryptAndVerify(
+      const { plaintext, messageId, sentAt } = decryptAndVerify(
         packet,
         me.privateKey,
-        key.publicKey
+        senderKey,
+        me.userID
       );
+
+      // Replay: o mesmo pacote assinado não é aceito duas vezes.
+      if (alreadySeen(messageId)) return;
 
       setMessages(previous => [
         ...previous,
         {
-          id: `${packet.timestamp}-${Math.random()}`,
+          id: messageId,
           direction: 'in',
           peer: packet.senderID,
           text: plaintext,
-          timestamp: packet.timestamp || Date.now(),
+          timestamp: sentAt,
           queued,
         },
       ]);
@@ -384,31 +459,27 @@ export default function App() {
 
       if (!me || packet.receiverID !== me.userID) return;
 
-      const key = await emitAck(socket, 'request_public_key', {
-        targetUserID: packet.senderID,
-      });
+      const senderKey = await getPeerKey(packet.senderID);
 
-      if (!key.success) {
-        throw new Error('Não foi possível obter a chave pública do remetente.');
-      }
-
-      const plaintext = decryptGroupAndVerify(
+      const { plaintext, messageId, sentAt } = decryptGroupAndVerify(
         packet,
         me.privateKey,
-        key.publicKey,
+        senderKey,
         me.userID
       );
+
+      if (alreadySeen(`${packet.groupID}:${messageId}`)) return;
 
       setMessages(previous => [
         ...previous,
         {
-          id: `${packet.timestamp}-${Math.random()}`,
+          id: messageId,
           type: 'group',
           groupID: packet.groupID,
           peer: packet.senderID,
           direction: 'in',
           text: plaintext,
-          timestamp: packet.timestamp || Date.now(),
+          timestamp: sentAt,
         },
       ]);
     } catch (error) {
@@ -456,19 +527,11 @@ export default function App() {
         throw new Error('A mensagem ultrapassa o limite de 28 bytes UTF-8.');
       }
 
-      const key = await emitAck(socket, 'request_public_key', {
-        targetUserID: recipient,
-      });
-
-      if (!key.success) {
-        throw new Error(
-          key.message || 'Chave pública do destinatário indisponível.'
-        );
-      }
+      const recipientKey = await getPeerKey(recipient);
 
       const packet = encryptForRecipient(
         draft,
-        key.publicKey,
+        recipientKey,
         me.privateKey,
         me.userID,
         recipient
@@ -487,11 +550,11 @@ export default function App() {
       setMessages(previous => [
         ...previous,
         {
-          id: `${Date.now()}-out-${Math.random()}`,
+          id: packet.messageId,
           direction: 'out',
           peer: recipient,
           text: draft,
-          timestamp: Date.now(),
+          timestamp: packet.sentAt,
         },
       ]);
 
@@ -531,6 +594,9 @@ export default function App() {
       throw new Error('A mensagem ultrapassa o limite de 28 bytes UTF-8.');
     }
 
+    // As chaves do grupo vêm do servidor: confere com as chaves fixadas.
+    for (const item of group.groupKeys) pinKey(item.username, item.publicKey);
+
     const encryptedPacket = encryptForGroup(
       draft,
       group.groupID,
@@ -552,13 +618,13 @@ export default function App() {
     setMessages(previous => [
       ...previous,
       {
-        id: `${Date.now()}-group-out-${Math.random()}`,
+        id: encryptedPacket.messageId,
         type: 'group',
         groupID: group.groupID,
         peer: me.userID,
         direction: 'out',
         text: draft,
-        timestamp: Date.now(),
+        timestamp: encryptedPacket.sentAt,
       },
     ]);
 
@@ -579,7 +645,19 @@ export default function App() {
         .map(value => value.trim())
         .filter(Boolean);
 
-      const response = await emitAck(socket, 'create_group', { members });
+      const me = identityRef.current;
+      if (!me) throw new Error('Registre uma identidade primeiro.');
+
+      // O criador assina a lista de membros: o servidor não pode alterá-la
+      // sem que os demais clientes detectem.
+      const allMembers = [...new Set([me.userID, ...members])];
+      const newID = newGroupID();
+
+      const response = await emitAck(socket, 'create_group', {
+        groupID: newID,
+        members: allMembers,
+        signature: signGroupGrant(me.privateKey, newID, allMembers, me.userID),
+      });
 
       if (!response.success) {
         throw new Error(response.message || 'Não foi possível criar o grupo.');
@@ -589,8 +667,13 @@ export default function App() {
         groupID: response.groupID,
         members: response.members,
         groupKeys: response.groupKeys,
-        createdBy: response.createdBy || identityRef.current?.userID,
+        createdBy: response.createdBy || me.userID,
+        signature: response.signature,
       };
+
+      if (!acceptGroup(newGroup)) {
+        throw new Error('O servidor devolveu um grupo inconsistente.');
+      }
 
       setGroups(previous => [
         ...previous.filter(group => group.groupID !== newGroup.groupID),
@@ -704,8 +787,13 @@ export default function App() {
               <code>{identity.publicKey}</code>
             </div>
 
+            <div>
+              <span className="key-label">Fingerprint (confira com seus contatos)</span>
+              <code>{fingerprint(identity.publicKey)}</code>
+            </div>
+
             <p>
-              A chave privada é mantida no armazenamento local deste navegador.
+              A chave privada é mantida em texto puro no armazenamento local deste navegador (limitação conhecida).
               Para uma aplicação real, implemente armazenamento protegido e
               recuperação segura.
             </p>

@@ -1,11 +1,24 @@
 const crypto = require('crypto');
+const { secp256k1 } = require('@noble/curves/secp256k1');
+const { sha256 } = require('@noble/hashes/sha256');
 const { users, publicKeys, messageQueue, groups } = require('./database');
 
 const ACK_TIMEOUT_MS = 5000;
 const MAX_QUEUE_PER_USER = 500;
 const MAX_GROUP_SIZE = 100;
 
-const GROUP_ALGORITHM = 'EC-ElGamal-secp256k1-group-demo';
+const PROTOCOL_VERSION = 2;
+const DIRECT_ALGORITHM = 'EC-ElGamal-secp256k1-direct-v2';
+const GROUP_ALGORITHM = 'EC-ElGamal-secp256k1-group-v2';
+
+// Domínios de assinatura: DEVEM ser idênticos aos do frontend (crypto.js).
+const REGISTER_DOMAIN = 'chat-ecc/register/v1';
+const GROUP_GRANT_DOMAIN = 'chat-ecc/group-grant/v1';
+
+// O servidor só VERIFICA assinaturas com chaves públicas (autenticação de
+// sessão e de grupos). Ele nunca cifra, decifra nem vê chaves privadas.
+const RATE_WINDOW_MS = 10_000;
+const RATE_MAX_EVENTS = 40;
 
 function reply(callback, data) {
     if (typeof callback === 'function') callback(data);
@@ -17,11 +30,46 @@ function isValidID(value) {
         value.length <= 128;
 }
 
-function isValidKey(value) {
-    return typeof value === 'string' &&
-        value.length > 0 &&
-        value.length <= 4096;
+const isHex = (value, length) =>
+    typeof value === 'string' &&
+    value.length === length &&
+    /^[0-9a-f]+$/i.test(value);
+
+// Ponto comprimido secp256k1 = 33 bytes (66 hex); assinatura compacta = 64 bytes (128 hex).
+const isPointHex = value => isHex(value, 66);
+const isSignatureHex = value => isHex(value, 128);
+const isMessageID = value => isHex(value, 32);
+const isTimestamp = value => Number.isSafeInteger(value) && value > 0;
+
+function isValidPublicKey(value) {
+    if (!isPointHex(value)) return false;
+    try {
+        secp256k1.ProjectivePoint.fromHex(value); // valida que está na curva
+        return true;
+    } catch {
+        return false;
+    }
 }
+
+function verifySignature(domain, fields, signature, publicKey) {
+    try {
+        const bytes = new TextEncoder().encode(`${domain}\n${JSON.stringify(fields)}`);
+        return secp256k1.verify(signature, sha256(bytes), publicKey);
+    } catch {
+        return false;
+    }
+}
+
+// Janela deslizante simples por socket.
+function allowed(socket) {
+    const now = Date.now();
+    const hits = (socket.data.hits || []).filter(t => now - t < RATE_WINDOW_MS);
+    hits.push(now);
+    socket.data.hits = hits;
+    return hits.length <= RATE_MAX_EVENTS;
+}
+
+const sortedMembers = members => [...new Set(members)].sort();
 
 function findSocketID(userID) {
     for (const [id, user] of users.entries()) {
@@ -87,6 +135,7 @@ function groupPublicData(groupID, group) {
         groupID,
         members: [...group.members],
         createdBy: group.createdBy,
+        signature: group.signature,
         groupKeys: group.members.map(username => ({
             username,
             publicKey: publicKeys.get(username),
@@ -110,11 +159,37 @@ module.exports = function setupSocket(io) {
     io.on('connection', socket => {
         console.log('User connected:', socket.id);
 
-        socket.on('register_public_key', ({ userID, publicKey } = {}, callback) => {
-            if (!isValidID(userID) || !isValidKey(publicKey)) {
+        // 1) O cliente pede um nonce de uso único.
+        socket.on('get_auth_challenge', (_payload, callback) => {
+            if (!allowed(socket)) {
+                return reply(callback, { success: false, message: 'Muitas requisições.' });
+            }
+
+            const nonce = crypto.randomBytes(32).toString('hex');
+            socket.data.nonce = nonce;
+            reply(callback, { success: true, nonce });
+        });
+
+        // 2) O cliente prova que possui a chave privada assinando [userID, nonce].
+        socket.on('register_public_key', ({ userID, publicKey, signature } = {}, callback) => {
+            if (!allowed(socket)) {
+                return reply(callback, { success: false, message: 'Muitas requisições.' });
+            }
+
+            if (!isValidID(userID) || !isValidPublicKey(publicKey) || !isSignatureHex(signature)) {
                 return reply(callback, {
                     success: false,
-                    message: 'userID ou publicKey inválidos.',
+                    message: 'userID, publicKey ou assinatura inválidos.',
+                });
+            }
+
+            const nonce = socket.data.nonce;
+            socket.data.nonce = null; // uso único: impede replay do registro
+
+            if (!nonce || !verifySignature(REGISTER_DOMAIN, [userID, nonce], signature, publicKey)) {
+                return reply(callback, {
+                    success: false,
+                    message: 'Falha na autenticação: assinatura do desafio inválida.',
                 });
             }
 
@@ -141,6 +216,10 @@ module.exports = function setupSocket(io) {
         });
 
         socket.on('request_public_key', ({ targetUserID } = {}, callback) => {
+            if (!allowed(socket)) {
+                return reply(callback, { success: false, message: 'Muitas requisições.' });
+            }
+
             const key = isValidID(targetUserID)
                 ? publicKeys.get(targetUserID)
                 : null;
@@ -166,10 +245,26 @@ module.exports = function setupSocket(io) {
                 });
             }
 
-            if (!payload || !isValidID(payload.receiverID)) {
+            if (!allowed(socket)) {
+                return reply(callback, { success: false, message: 'Muitas requisições.' });
+            }
+
+            const valid =
+                payload &&
+                isValidID(payload.receiverID) &&
+                payload.version === PROTOCOL_VERSION &&
+                payload.algorithm === DIRECT_ALGORITHM &&
+                payload.senderID === sender.userID &&
+                isMessageID(payload.messageId) &&
+                isTimestamp(payload.sentAt) &&
+                isPointHex(payload.c1) &&
+                isPointHex(payload.c2) &&
+                isSignatureHex(payload.signature);
+
+            if (!valid) {
                 return reply(callback, {
                     success: false,
-                    message: 'receiverID inválido.',
+                    message: 'Pacote inválido (versão, algoritmo, remetente ou campos).',
                 });
             }
 
@@ -180,11 +275,19 @@ module.exports = function setupSocket(io) {
                 });
             }
 
+            // Whitelist: só os campos conhecidos são repassados.
             const packet = {
-                ...payload,
                 type: 'direct',
+                version: payload.version,
+                algorithm: payload.algorithm,
                 senderID: sender.userID,
-                timestamp: Date.now(),
+                receiverID: payload.receiverID,
+                messageId: payload.messageId,
+                sentAt: payload.sentAt,
+                c1: payload.c1,
+                c2: payload.c2,
+                signature: payload.signature,
+                timestamp: Date.now(), // recebimento no servidor; NÃO é assinado
             };
 
             const result = deliver(
@@ -215,7 +318,9 @@ module.exports = function setupSocket(io) {
         });
 
         // Criação de grupo e distribuição de metadados/chaves públicas.
-        socket.on('create_group', ({ members } = {}, callback) => {
+        // O criador gera o groupID e assina [groupID, membros ordenados, criador].
+        // O servidor confere a assinatura, mas não consegue forjar nem alterar a lista.
+        socket.on('create_group', ({ groupID, members, signature } = {}, callback) => {
             const creator = users.get(socket.id);
 
             if (!creator) {
@@ -225,22 +330,40 @@ module.exports = function setupSocket(io) {
                 });
             }
 
-            if (!Array.isArray(members) || !members.every(isValidID)) {
+            if (!allowed(socket)) {
+                return reply(callback, { success: false, message: 'Muitas requisições.' });
+            }
+
+            if (
+                !isMessageID(groupID) ||
+                !Array.isArray(members) ||
+                !members.every(isValidID) ||
+                !isSignatureHex(signature)
+            ) {
                 return reply(callback, {
                     success: false,
-                    message: 'Lista de membros inválida.',
+                    message: 'Dados de grupo inválidos.',
                 });
             }
 
-            const uniqueMembers = [
-                ...new Set([creator.userID, ...members.map(id => id.trim())]),
-            ];
+            const uniqueMembers = sortedMembers(members.map(id => id.trim()));
 
-            if (uniqueMembers.length > MAX_GROUP_SIZE) {
+            if (!uniqueMembers.includes(creator.userID)) {
                 return reply(callback, {
                     success: false,
-                    message: 'Grupo excede o limite de membros.',
+                    message: 'O criador deve fazer parte do grupo.',
                 });
+            }
+
+            if (uniqueMembers.length < 2 || uniqueMembers.length > MAX_GROUP_SIZE) {
+                return reply(callback, {
+                    success: false,
+                    message: 'Tamanho de grupo inválido.',
+                });
+            }
+
+            if (groups.has(groupID)) {
+                return reply(callback, { success: false, message: 'groupID já existe.' });
             }
 
             const unknown = uniqueMembers.filter(id => !publicKeys.has(id));
@@ -252,11 +375,24 @@ module.exports = function setupSocket(io) {
                 });
             }
 
-            const groupID = crypto.randomUUID();
+            const grantOK = verifySignature(
+                GROUP_GRANT_DOMAIN,
+                [groupID, uniqueMembers, creator.userID],
+                signature,
+                creator.publicKey
+            );
+
+            if (!grantOK) {
+                return reply(callback, {
+                    success: false,
+                    message: 'Assinatura do grupo inválida.',
+                });
+            }
 
             const group = {
                 members: uniqueMembers,
                 createdBy: creator.userID,
+                signature,
             };
 
             groups.set(groupID, group);
@@ -277,12 +413,7 @@ module.exports = function setupSocket(io) {
                 ...data,
             });
 
-            console.log(
-                'Group created:',
-                groupID,
-                'members:',
-                uniqueMembers
-            );
+            console.log('Group created:', groupID, 'members:', uniqueMembers);
         });
 
         // Cada bloco tem um destinatário, um C2 e uma assinatura ECDSA.
@@ -297,11 +428,18 @@ module.exports = function setupSocket(io) {
                 });
             }
 
+            if (!allowed(socket)) {
+                return reply(callback, { success: false, message: 'Muitas requisições.' });
+            }
+
             if (
                 !payload ||
-                !isValidID(payload.groupID) ||
-                !isValidKey(payload.c1) ||
-                !Array.isArray(payload.encryptedBlocks)
+                !isMessageID(payload.groupID) ||
+                !isPointHex(payload.c1) ||
+                !isMessageID(payload.messageId) ||
+                !isTimestamp(payload.sentAt) ||
+                !Array.isArray(payload.encryptedBlocks) ||
+                payload.encryptedBlocks.length > MAX_GROUP_SIZE
             ) {
                 return reply(callback, {
                     success: false,
@@ -326,7 +464,7 @@ module.exports = function setupSocket(io) {
             }
 
             if (
-                payload.version !== 1 ||
+                payload.version !== PROTOCOL_VERSION ||
                 payload.algorithm !== GROUP_ALGORITHM ||
                 payload.senderID !== sender.userID
             ) {
@@ -355,8 +493,8 @@ module.exports = function setupSocket(io) {
                 if (
                     !block ||
                     !isValidID(block.username) ||
-                    !isValidKey(block.c2) ||
-                    !isValidKey(block.signature)
+                    !isPointHex(block.c2) ||
+                    !isSignatureHex(block.signature)
                 ) {
                     return reply(callback, {
                         success: false,
@@ -404,6 +542,8 @@ module.exports = function setupSocket(io) {
                     groupID: payload.groupID,
                     senderID: sender.userID,
                     receiverID: recipientID,
+                    messageId: payload.messageId,
+                    sentAt: payload.sentAt,
                     c1: payload.c1,
                     c2: block.c2,
                     signature: block.signature,

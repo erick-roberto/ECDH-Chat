@@ -1,5 +1,5 @@
 {
-  "name": "ecdh-chat-frontend",
+  "name": "chat-ecc-frontend",
   "private": true,
   "version": "1.0.0",
   "type": "module",

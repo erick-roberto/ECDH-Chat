@@ -19,7 +19,7 @@ const io = new Server(server, {
         origin: CORS_ORIGIN,
         methods: ['GET', 'POST'],
     },
-    maxHttpBufferSize: 1e6, // 1 MB por mensagem
+    maxHttpBufferSize: 64 * 1024, // 64 KB por evento (pacotes cifrados são pequenos)
 });
 
 setupSocket(io);

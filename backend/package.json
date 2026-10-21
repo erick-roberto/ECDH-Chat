@@ -1,25 +1,27 @@
 {
-  "name": "chat-ecc-backend",
-  "version": "1.0.0",
-  "description": "Backend para Chat E2EE com ECC",
-  "main": "server.js",
-  "scripts": {
-    "dev": "nodemon server.js",
-    "start": "node server.js"
-  },
-  "dependencies": {
-  "@noble/curves": "1.8.2",
-  "@noble/hashes": "1.7.1",
-  "cors": "^2.8.6",
-  "express": "^4.22.3",
-  "socket.io": "^4.8.4"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.14",
-    "socket.io-client": "^4.8.4"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs"
+"name": "chat-ecc-backend",
+"version": "1.0.0",
+"description": "Backend para Chat E2EE com ECC",
+"main": "server.js",
+"scripts": {
+"dev": "nodemon server.js",
+"start": "node server.js"
+},
+"dependencies": {
+"@noble/curves": "1.8.2",
+"@noble/hashes": "1.7.1",
+"cors": "^2.8.6",
+"dotenv": "^18.0.8",
+"express": "^4.22.3",
+"pg": "^8.23.1",
+"socket.io": "^4.8.4"
+},
+"devDependencies": {
+"nodemon": "^3.1.14",
+"socket.io-client": "^4.8.4"
+},
+"keywords": [],
+"author": "",
+"license": "ISC",
+"type": "commonjs"
 }

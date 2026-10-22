@@ -26,14 +26,18 @@ export function pinKey(userID, publicKey) {
   if (!pins[userID]) {
     pins[userID] = publicKey;
     save(PINS_KEY, pins);
-    return 'new';
+    return { status: 'new' };
   }
   if (pins[userID] !== publicKey) {
-    throw new Error(
-      `A chave pública de "${userID}" mudou. Possível ataque man-in-the-middle; verifique o fingerprint com a pessoa antes de continuar.`
-    );
+    return { status: 'changed' };
   }
-  return 'same';
+  return { status: 'same' };
+}
+
+export function acceptNewKey(userID, publicKey) {
+  const pins = load(PINS_KEY, {});
+  pins[userID] = publicKey;
+  save(PINS_KEY, pins);
 }
 
 export function forgetPin(userID) {

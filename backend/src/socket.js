@@ -1,7 +1,14 @@
 const crypto = require('crypto');
 const { secp256k1 } = require('@noble/curves/secp256k1');
 const { sha256 } = require('@noble/hashes/sha256');
-const { users, publicKeys, messageQueue, groups } = require('./database');
+const {
+    users,
+    publicKeys,
+    messageQueue,
+    groups,
+    persistUserPublicKey,
+    getPersistedPublicKey,
+} = require('./database');
 
 const ACK_TIMEOUT_MS = 5000;
 const MAX_QUEUE_PER_USER = 500;
@@ -171,12 +178,20 @@ module.exports = function setupSocket(io) {
         });
 
         // 2) O cliente prova que possui a chave privada assinando [userID, nonce].
-        socket.on('register_public_key', ({ userID, publicKey, signature } = {}, callback) => {
+        
+        socket.on('register_public_key', async ({ userID, publicKey, signature } = {}, callback) => {
             if (!allowed(socket)) {
-                return reply(callback, { success: false, message: 'Muitas requisições.' });
+                return reply(callback, {
+                    success: false,
+                    message: 'Muitas requisições.',
+                });
             }
 
-            if (!isValidID(userID) || !isValidPublicKey(publicKey) || !isSignatureHex(signature)) {
+            if (
+                !isValidID(userID) ||
+                !isValidPublicKey(publicKey) ||
+                !isSignatureHex(signature)
+            ) {
                 return reply(callback, {
                     success: false,
                     message: 'userID, publicKey ou assinatura inválidos.',
@@ -184,15 +199,25 @@ module.exports = function setupSocket(io) {
             }
 
             const nonce = socket.data.nonce;
-            socket.data.nonce = null; // uso único: impede replay do registro
+            socket.data.nonce = null;
 
-            if (!nonce || !verifySignature(REGISTER_DOMAIN, [userID, nonce], signature, publicKey)) {
+            if (
+                !nonce ||
+                !verifySignature(
+                    REGISTER_DOMAIN,
+                    [userID, nonce],
+                    signature,
+                    publicKey
+                )
+            ) {
                 return reply(callback, {
                     success: false,
                     message: 'Falha na autenticação: assinatura do desafio inválida.',
                 });
             }
 
+            // Se o usuário já está registrado nesta execução,
+            // impede que outra chave seja usada para o mesmo ID.
             const existing = publicKeys.get(userID);
 
             if (existing && existing !== publicKey) {
@@ -202,37 +227,94 @@ module.exports = function setupSocket(io) {
                 });
             }
 
-            publicKeys.set(userID, publicKey);
-            users.set(socket.id, { userID, publicKey });
+            try {
+                // Persiste a identidade antes de aceitar a sessão.
+                const persistedUser = await persistUserPublicKey(
+                    userID,
+                    publicKey
+                );
 
-            reply(callback, { success: true });
+                if (!persistedUser) {
+                    return reply(callback, {
+                        success: false,
+                        message: 'userID já registrado com outra chave pública.',
+                    });
+                }
 
-            io.emit('user_list_update', onlineUserIDs());
+                // Atualiza o cache e registra o socket online.
+                publicKeys.set(userID, persistedUser.public_key);
 
-            // Envia ao cliente os grupos que ele já integra.
-            sendGroupsToUser(socket, userID);
+                users.set(socket.id, {
+                    userID,
+                    publicKey: persistedUser.public_key,
+                });
 
-            flushQueue(socket, userID);
-        });
+                reply(callback, { success: true });
 
-        socket.on('request_public_key', ({ targetUserID } = {}, callback) => {
-            if (!allowed(socket)) {
-                return reply(callback, { success: false, message: 'Muitas requisições.' });
-            }
+                io.emit('user_list_update', onlineUserIDs());
 
-            const key = isValidID(targetUserID)
-                ? publicKeys.get(targetUserID)
-                : null;
+                sendGroupsToUser(socket, userID);
 
-            if (key) {
-                reply(callback, { success: true, publicKey: key });
-            } else {
-                reply(callback, {
+                flushQueue(socket, userID);
+            } catch (error) {
+                console.error(
+                    'Erro ao persistir usuário:',
+                    error.message
+                );
+
+                return reply(callback, {
                     success: false,
-                    message: `Chave pública não encontrada para ${targetUserID}.`,
+                    message: 'Não foi possível registrar o usuário no banco de dados.',
                 });
             }
         });
+
+
+        
+        socket.on('request_public_key', async ({ targetUserID } = {}, callback) => {
+            if (!allowed(socket)) {
+                return reply(callback, {
+                    success: false,
+                    message: 'Muitas requisições.',
+                });
+            }
+
+            if (!isValidID(targetUserID)) {
+                return reply(callback, {
+                    success: false,
+                    message: 'Identificador do usuário inválido.',
+                });
+            }
+
+            try {
+                const key = await getPersistedPublicKey(targetUserID);
+
+                if (key) {
+                    publicKeys.set(targetUserID, key);
+
+                    return reply(callback, {
+                        success: true,
+                        publicKey: key,
+                    });
+                }
+
+                return reply(callback, {
+                    success: false,
+                    message: `Chave pública não encontrada para ${targetUserID}.`,
+                });
+            } catch (error) {
+                console.error(
+                    'Erro ao consultar chave pública:',
+                    error.message
+                );
+
+                return reply(callback, {
+                    success: false,
+                    message: 'Não foi possível consultar a chave pública.',
+                });
+            }
+        });
+
 
         // Mensagem direta: o servidor continua sem decifrar o conteúdo.
         socket.on('send_encrypted_message', (payload, callback) => {

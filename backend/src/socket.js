@@ -8,6 +8,13 @@ const {
     groups,
     persistUserPublicKey,
     getPersistedPublicKey,
+    persistDirectMessage,
+    persistGroupMessages,
+    getPendingMessages,
+    markMessagesDelivered,
+    getDirectHistory,
+    persistGroup,
+    loadPersistedGroups,
 } = require('./database');
 
 const ACK_TIMEOUT_MS = 5000;
@@ -113,29 +120,52 @@ function deliver(io, userID, event, packet) {
     };
 }
 
-function flushQueue(socket, userID) {
-    const pending = messageQueue.get(userID);
-    if (!pending || pending.length === 0) return;
 
-    const batch = [...pending];
+async function flushQueue(socket, userID) {
+    try {
+        const pending = await getPendingMessages(userID);
 
-    socket.timeout(ACK_TIMEOUT_MS).emit(
-        'pending_messages',
-        batch,
-        err => {
-            if (err) return;
+        if (pending.length === 0) return;
 
-            const remaining = (messageQueue.get(userID) || [])
-                .filter(message => !batch.includes(message));
+        // Mantém o limite do lote para evitar um evento excessivamente grande.
+        const batch = pending.slice(0, MAX_QUEUE_PER_USER);
+        const packets = batch.map(item => item.packet);
+        const databaseIDs = batch.map(item => item.dbId);
 
-            if (remaining.length > 0) {
-                messageQueue.set(userID, remaining);
-            } else {
-                messageQueue.delete(userID);
+        socket.timeout(ACK_TIMEOUT_MS).emit(
+            'pending_messages',
+            packets,
+            async (err, response) => {
+                if (err) return;
+
+                if (!response || response.success !== true) {
+                console.warn(
+                    `O cliente não confirmou o processamento das mensagens de ${userID}.`
+                );
+                return;
+                }
+
+                try {
+                await markMessagesDelivered(databaseIDs, userID);
+                console.log(
+                    `Mensagens pendentes confirmadas para ${userID}: ${databaseIDs.length}`
+                );
+                } catch (error) {
+                console.error(
+                    'Erro ao atualizar mensagens entregues:',
+                    error.message
+                );
+                }
             }
-        }
-    );
+            );
+    } catch (error) {
+        console.error(
+            `Erro ao recuperar mensagens pendentes de ${userID}:`,
+            error.message
+        );
+    }
 }
+
 
 function groupPublicData(groupID, group) {
     return {
@@ -229,6 +259,7 @@ module.exports = function setupSocket(io) {
 
             try {
                 // Persiste a identidade antes de aceitar a sessão.
+                await loadPersistedGroups();
                 const persistedUser = await persistUserPublicKey(
                     userID,
                     publicKey
@@ -317,7 +348,8 @@ module.exports = function setupSocket(io) {
 
 
         // Mensagem direta: o servidor continua sem decifrar o conteúdo.
-        socket.on('send_encrypted_message', (payload, callback) => {
+        
+        socket.on('send_encrypted_message', async (payload, callback) => {
             const sender = users.get(socket.id);
 
             if (!sender) {
@@ -328,7 +360,10 @@ module.exports = function setupSocket(io) {
             }
 
             if (!allowed(socket)) {
-                return reply(callback, { success: false, message: 'Muitas requisições.' });
+                return reply(callback, {
+                    success: false,
+                    message: 'Muitas requisições.',
+                });
             }
 
             const valid =
@@ -357,7 +392,6 @@ module.exports = function setupSocket(io) {
                 });
             }
 
-            // Whitelist: só os campos conhecidos são repassados.
             const packet = {
                 type: 'direct',
                 version: payload.version,
@@ -369,40 +403,60 @@ module.exports = function setupSocket(io) {
                 c1: payload.c1,
                 c2: payload.c2,
                 signature: payload.signature,
-                timestamp: Date.now(), // recebimento no servidor; NÃO é assinado
+                timestamp: Date.now(),
             };
 
-            const result = deliver(
-                io,
-                payload.receiverID,
-                'receive_encrypted_message',
-                packet
-            );
+            try {
+                // Persiste antes de tentar encaminhar.
+                const databaseID = await persistDirectMessage(packet);
 
-            if (result.delivered) {
-                reply(callback, {
-                    success: true,
-                    delivered: true,
-                    message: 'Mensagem encaminhada.',
-                });
-            } else if (result.queued) {
-                reply(callback, {
+                const recipientSocketID = findSocketID(payload.receiverID);
+
+                if (recipientSocketID) {
+                    io.to(recipientSocketID).emit(
+                        'receive_encrypted_message',
+                        packet
+                    );
+
+                    // O status "delivered" indica encaminhamento pelo servidor.
+                    await markMessagesDelivered(
+                        [databaseID],
+                        payload.receiverID
+                    );
+
+                    return reply(callback, {
+                        success: true,
+                        delivered: true,
+                        message: 'Mensagem salva e encaminhada.',
+                    });
+                }
+
+                // A mensagem já está salva com status "pending".
+                // Não precisamos mais colocá-la na fila em memória.
+                return reply(callback, {
                     success: true,
                     delivered: false,
-                    message: 'Destinatário offline; mensagem colocada na fila.',
+                    queued: true,
+                    message: 'Mensagem salva; será entregue quando o destinatário se conectar.',
                 });
-            } else {
-                reply(callback, {
+            } catch (error) {
+                console.error(
+                    'Erro ao persistir ou encaminhar mensagem:',
+                    error.message
+                );
+
+                return reply(callback, {
                     success: false,
-                    message: 'Fila do destinatário cheia.',
+                    message: 'Não foi possível salvar a mensagem no banco de dados.',
                 });
             }
         });
 
+
         // Criação de grupo e distribuição de metadados/chaves públicas.
         // O criador gera o groupID e assina [groupID, membros ordenados, criador].
         // O servidor confere a assinatura, mas não consegue forjar nem alterar a lista.
-        socket.on('create_group', ({ groupID, members, signature } = {}, callback) => {
+        socket.on('create_group', async ({ groupID, members, signature } = {}, callback) => {
             const creator = users.get(socket.id);
 
             if (!creator) {
@@ -477,7 +531,18 @@ module.exports = function setupSocket(io) {
                 signature,
             };
 
-            groups.set(groupID, group);
+            try {
+                // O grupo só entra no cache depois de ser salvo no banco.
+                await persistGroup(groupID, group);
+                groups.set(groupID, group);
+            } catch (error) {
+                console.error('Erro ao persistir grupo:', error.message);
+
+                return reply(callback, {
+                    success: false,
+                    message: 'Não foi possível salvar o grupo no banco de dados.',
+                });
+            }
 
             const data = groupPublicData(groupID, group);
 
@@ -500,7 +565,7 @@ module.exports = function setupSocket(io) {
 
         // Cada bloco tem um destinatário, um C2 e uma assinatura ECDSA.
         // O C1 é compartilhado por todos os blocos da mesma mensagem.
-        socket.on('send_group_encrypted_message', (payload, callback) => {
+        socket.on('send_group_encrypted_message', async (payload, callback) => {
             const sender = users.get(socket.id);
 
             if (!sender) {
@@ -609,15 +674,14 @@ module.exports = function setupSocket(io) {
                 }
             }
 
-            let deliveredCount = 0;
-            let queuedCount = 0;
-            let failedCount = 0;
+            
             const timestamp = Date.now();
 
-            for (const recipientID of expectedRecipients) {
+            // Monta um pacote independente para cada destinatário.
+            const packets = expectedRecipients.map(recipientID => {
                 const block = blockByUser.get(recipientID);
 
-                const packet = {
+                return {
                     type: 'group',
                     version: payload.version,
                     algorithm: payload.algorithm,
@@ -631,26 +695,123 @@ module.exports = function setupSocket(io) {
                     signature: block.signature,
                     timestamp,
                 };
+            });
 
-                const result = deliver(
-                    io,
-                    recipientID,
-                    'receive_group_encrypted_message',
-                    packet
+            try {
+                // 1. Persiste todos os pacotes antes de encaminhar qualquer um.
+                const savedMessages = await persistGroupMessages(packets);
+
+                let deliveredCount = 0;
+                let queuedCount = 0;
+
+                // 2. Encaminha os pacotes e atualiza o estado de entrega.
+                for (const saved of savedMessages) {
+                    const packet = saved.packet;
+                    const recipientSocketID = findSocketID(packet.receiverID);
+
+                    if (!recipientSocketID) {
+                        // A mensagem permanece pendente no PostgreSQL.
+                        queuedCount++;
+                        continue;
+                    }
+
+                    io.to(recipientSocketID).emit(
+                        'receive_group_encrypted_message',
+                        packet
+                    );
+
+                    try {
+                        await markMessagesDelivered(
+                            [saved.dbId],
+                            packet.receiverID
+                        );
+
+                        deliveredCount++;
+                    } catch (error) {
+                        // A mensagem já foi encaminhada, mas o status
+                        // continua pendente se a atualização falhar.
+                        console.error(
+                            'Erro ao atualizar entrega da mensagem de grupo:',
+                            error.message
+                        );
+
+                        queuedCount++;
+                    }
+                }
+
+                return reply(callback, {
+                    success: true,
+                    delivered: deliveredCount,
+                    queued: queuedCount,
+                    failed: 0,
+                    message: 'Mensagens de grupo salvas no banco de dados.',
+                });
+            } catch (error) {
+                console.error(
+                    'Erro ao persistir mensagens de grupo:',
+                    error.message
                 );
 
-                if (result.delivered) deliveredCount++;
-                else if (result.queued) queuedCount++;
-                else failedCount++;
+                return reply(callback, {
+                    success: false,
+                    message: 'Não foi possível salvar as mensagens do grupo.',
+                });
             }
 
-            reply(callback, {
-                success: true,
-                delivered: deliveredCount,
-                queued: queuedCount,
-                failed: failedCount,
-            });
         });
+
+        
+        socket.on('request_direct_history', async ({ peerID } = {}, callback) => {
+            const currentUser = users.get(socket.id);
+
+            if (!currentUser) {
+                return reply(callback, {
+                    success: false,
+                    message: 'Registre sua chave pública primeiro.',
+                });
+            }
+
+            if (!allowed(socket)) {
+                return reply(callback, {
+                    success: false,
+                    message: 'Muitas requisições.',
+                });
+            }
+
+            if (
+                !isValidID(peerID) ||
+                peerID === currentUser.userID
+            ) {
+                return reply(callback, {
+                    success: false,
+                    message: 'Identificador do contato inválido.',
+                });
+            }
+
+            try {
+                const history = await getDirectHistory(
+                    currentUser.userID,
+                    peerID
+                );
+
+                return reply(callback, {
+                    success: true,
+                    peerID,
+                    messages: history,
+                });
+            } catch (error) {
+                console.error(
+                    'Erro ao recuperar histórico de mensagens:',
+                    error.message
+                );
+
+                return reply(callback, {
+                    success: false,
+                    message: 'Não foi possível recuperar o histórico.',
+                });
+            }
+        });
+
 
         socket.on('disconnect', () => {
             const user = users.get(socket.id);

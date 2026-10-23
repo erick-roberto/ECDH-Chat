@@ -1,29 +1,34 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   createIdentity, publicFromPrivate, validatePrivateKey, signRegistration,
-  newGroupID, signGroupGrant, verifyGroupGrant, fingerprint,
+  newGroupID, signGroupGrant, verifyGroupGrant, fingerprint, signKeyRotation,
 } from './crypto';
 import { runCrypto } from './workerClient';
 import { saveIdentitySecurely, loadIdentitySecurely, hasSecureIdentity } from './vault';
 import { createSocket, emitAck } from './socket';
 import { pinKey, acceptNewKey, alreadySeen } from './keyring';
 
-const LOCAL_MESSAGES_PREFIX = 'chat-ecc.messages.v2:'; // Atualizado para nova versão encriptada
+const LOCAL_MESSAGES_PREFIX = 'chat-ecc.messages.v2:';
+let messagesSaveQueue = Promise.resolve();
 
-// Encriptação Local (Histórico Seguro)
 async function saveMessagesSecurely(userID, messages, password) {
-  try {
-    const salt = crypto.getRandomValues(new Uint8Array(16));
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), { name: 'PBKDF2' }, false, ['deriveKey']);
-    const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, keyMaterial, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
-    const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(messages)));
-    
-    const payload = { salt: Array.from(salt), iv: Array.from(iv), data: Array.from(new Uint8Array(encrypted)) };
-    localStorage.setItem(`${LOCAL_MESSAGES_PREFIX}${userID}`, JSON.stringify(payload));
-  } catch (e) {
-    console.error('Erro ao cifrar mensagens locais:', e);
-  }
+  const task = messagesSaveQueue.then(async () => {
+    try {
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), { name: 'PBKDF2' }, false, ['deriveKey']);
+      const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, keyMaterial, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
+      const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(messages)));
+
+      const payload = { salt: Array.from(salt), iv: Array.from(iv), data: Array.from(new Uint8Array(encrypted)) };
+      localStorage.setItem(`${LOCAL_MESSAGES_PREFIX}${userID}`, JSON.stringify(payload));
+    } catch (e) {
+      console.error('Erro ao cifrar mensagens locais:', e);
+    }
+  });
+
+  messagesSaveQueue = task;
+  return task;
 }
 
 async function loadMessagesSecurely(userID, password) {
@@ -31,7 +36,6 @@ async function loadMessagesSecurely(userID, password) {
     const saved = localStorage.getItem(`${LOCAL_MESSAGES_PREFIX}${userID}`);
     if (!saved) return [];
     const payload = JSON.parse(saved);
-    if (Array.isArray(payload)) return payload; // Fallback temporário
     
     const salt = new Uint8Array(payload.salt);
     const iv = new Uint8Array(payload.iv);
@@ -82,18 +86,21 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [privateImport, setPrivateImport] = useState('');
   const [groupMembers, setGroupMembers] = useState('');
-  const [groupID, setGroupID] = useState('');
   const [conversationSearch, setConversationSearch] = useState('');
   const [groups, setGroups] = useState([]);
   const [activeGroupID, setActiveGroupID] = useState('');
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
 
   const identityRef = useRef(identity);
   const userRef = useRef(userID);
   const vaultPasswordRef = useRef(vaultPassword);
+  const groupsRef = useRef(groups);
 
   useEffect(() => { identityRef.current = identity; }, [identity]);
   useEffect(() => { userRef.current = userID; }, [userID]);
   useEffect(() => { vaultPasswordRef.current = vaultPassword; }, [vaultPassword]);
+  useEffect(() => { groupsRef.current = groups; }, [groups]);
 
   function rememberMessage(message) {
     const currentUserID = identityRef.current?.userID;
@@ -121,7 +128,7 @@ export default function App() {
 
   const conversations = useMemo(() => {
     const directMessages = messages.filter(message => !message.groupID && message.type !== 'group');
-    const contactIDs = new Set(users);
+    const contactIDs = new Set();
     directMessages.forEach(message => { if (message.peer) contactIDs.add(message.peer); });
     contactIDs.delete(identity?.userID || userID);
 
@@ -162,16 +169,31 @@ export default function App() {
   }, [activeMessages, target]);
 
   useEffect(() => {
-    socket.on('connect', () => setStatus('Conectado'));
+    let hadConnection = false;
+
+    socket.on('connect', async () => {
+      setStatus('Conectado');
+      const reconnected = hadConnection;
+      hadConnection = true;
+      if (!reconnected) return;
+
+      const me = identityRef.current;
+      if (!me || !vaultPasswordRef.current) return;
+
+      try {
+        await authenticate(me.userID, me);
+      } catch (error) {
+        setNotice(`Reconexão automática falhou: ${error.message}`);
+      }
+    });
     socket.on('disconnect', () => setStatus('Desconectado'));
     socket.on('connect_error', err => setNotice(`Falha de conexão: ${err.message}`));
-    // Vazamento de usuários mitigado no backend (recebe array restrito ou vazio)
     socket.on('user_list_update', list => {
       setUsers(Array.isArray(list) ? list.filter(id => id !== userRef.current) : []);
     });
     socket.on('receive_encrypted_message', packet => handleIncoming(packet));
     socket.on('receive_group_encrypted_message', packet => handleIncomingGroup(packet));
-    socket.on('your_groups', async groupList => {
+    socket.on('your_groups', groupList => {
       const accepted = [];
       for (const group of Array.isArray(groupList) ? groupList : []) {
         if (acceptGroup(group)) accepted.push(group);
@@ -206,6 +228,7 @@ export default function App() {
     setBusy(true);
     try {
       const id = await loadIdentitySecurely(vaultPassword);
+      if (!id) throw new Error('Cofre local não encontrado.');
       setIdentity(id);
       setUserID(id.userID);
       const msgs = await loadMessagesSecurely(id.userID, vaultPassword);
@@ -219,8 +242,8 @@ export default function App() {
     }
   }
 
-  async function register(id, ident, password) {
-    const normalizedID = id.trim();
+  async function authenticate(id, ident) {
+    const normalizedID = String(id || '').trim();
     if (!normalizedID) throw new Error('Informe um identificador de usuário.');
 
     const challenge = await emitAck(socket, 'get_auth_challenge', {});
@@ -233,6 +256,12 @@ export default function App() {
     });
 
     if (!response.success) throw new Error(response.message || 'Registro recusado.');
+
+    return normalizedID;
+  }
+
+  async function register(id, ident, password) {
+    const normalizedID = await authenticate(id, ident);
 
     const next = { ...ident, userID: normalizedID };
     await saveIdentitySecurely(next, password);
@@ -293,7 +322,7 @@ export default function App() {
   async function importIdentity() {
     setBusy(true);
     try {
-      if (!vaultPassword || vaultPassword.length < 4) throw new Error('Crie uma palavra-passe forte para o cofre.');
+      if (!vaultPassword || vaultPassword.length < 3) throw new Error('Crie uma palavra-passe forte para o cofre.');
       const privateKey = privateImport.trim().toLowerCase();
       validatePrivateKey(privateKey);
       
@@ -301,6 +330,59 @@ export default function App() {
       await ensureConnected();
       await register(userID, imported, vaultPassword);
       setPrivateImport('');
+    } catch (error) {
+      setNotice(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function rotateIdentity() {
+    setBusy(true);
+    try {
+      if (!currentPassword) throw new Error('Introduza a palavra-passe atual do cofre.');
+      if (newPassword.length < 3) throw new Error('A nova palavra-passe deve ter pelo menos 3 caracteres.');
+
+      const previous = await loadIdentitySecurely(currentPassword);
+      const activeUserID = identityRef.current?.userID || userID;
+
+      if (!previous?.userID || previous.userID !== activeUserID) {
+        throw new Error('A palavra-passe atual não corresponde à identidade ativa.');
+      }
+
+      await ensureConnected();
+
+      const challenge = await emitAck(socket, 'get_auth_challenge', {});
+      if (!challenge.success || !challenge.nonce) throw new Error('Não foi possível obter o desafio de autenticação.');
+
+      const next = createIdentity();
+      const response = await emitAck(socket, 'register_public_key', {
+        userID: previous.userID,
+        publicKey: next.publicKey,
+        signature: signRegistration(next.privateKey, previous.userID, challenge.nonce),
+        previousPublicKey: previous.publicKey,
+        rotationSignature: signKeyRotation(
+          previous.privateKey, previous.userID, previous.publicKey, next.publicKey, challenge.nonce
+        ),
+      });
+
+      if (!response.success) throw new Error(response.message || 'Troca de chave recusada.');
+
+      const updated = { ...next, userID: previous.userID };
+      const history = await loadMessagesSecurely(previous.userID, currentPassword);
+      await saveIdentitySecurely(updated, newPassword);
+      await saveMessagesSecurely(previous.userID, history, newPassword);
+
+      setIdentity(updated);
+      identityRef.current = updated;
+      setUserID(updated.userID);
+      userRef.current = updated.userID;
+      setVaultPassword(newPassword);
+      vaultPasswordRef.current = newPassword;
+      setMessages(history);
+      setCurrentPassword('');
+      setNewPassword('');
+      setNotice('Chave rotacionada. A chave antiga assinou a nova e o cofre foi atualizado.');
     } catch (error) {
       setNotice(error.message);
     } finally {
@@ -338,7 +420,20 @@ export default function App() {
 
       for (const item of keys) {
         const pin = pinKey(item.username, item.publicKey);
-        if(pin.status === 'changed') acceptNewKey(item.username, item.publicKey); 
+        if (pin.status === 'changed') {
+          if (item.username === (identityRef.current?.userID || userRef.current)) {
+            acceptNewKey(item.username, item.publicKey);
+            continue;
+          }
+          const accept = window.confirm(
+            `A chave pública de "${item.username}" mudou.\n\nNovo Fingerprint: ${fingerprint(item.publicKey)}\n\nAceitar a nova chave no grupo?`
+          );
+          if (!accept) {
+            setNotice(`Grupo recusado: a chave pública de ${item.username} mudou.`);
+            return false;
+          }
+          acceptNewKey(item.username, item.publicKey);
+        }
       }
 
       const creatorKey = keys.find(item => item.username === group.createdBy)?.publicKey;
@@ -361,7 +456,6 @@ export default function App() {
         return;
       }
 
-      // Verificação de Frescor (Replay protection) mitigada: ±5 minutos
       if (Math.abs(Date.now() - packet.sentAt) > 300000) {
           throw new Error('Carimbo de tempo expirado (Possível ataque de replay).');
       }
@@ -373,7 +467,7 @@ export default function App() {
 
       rememberMessage({ id: messageId, direction: 'in', peer: packet.senderID, text: plaintext, timestamp: sentAt, queued });
     } catch (error) {
-      setNotice(`Mensagem rejeitada: ${error.message}`);
+      if (!fromHistory) setNotice(`Mensagem rejeitada: ${error.message}`);
       if (queued) throw error;
     }
   }
@@ -407,8 +501,7 @@ export default function App() {
           throw new Error('Mensagem de grupo expirada.');
       }
 
-      // Conferir filiação do remetente
-      const group = groups.find(g => g.groupID === packet.groupID);
+      const group = groupsRef.current.find(g => g.groupID === packet.groupID);
       if (group && !group.members.includes(packet.senderID)) {
           throw new Error('Remetente intruso detectado fora da lista de membros do grupo.');
       }
@@ -421,7 +514,7 @@ export default function App() {
       rememberMessage({ id: messageId, type: 'group', groupID: packet.groupID, peer: packet.senderID, direction: 'in', text: plaintext, timestamp: sentAt });
     } catch (error) {
       setNotice(`Mensagem de grupo rejeitada: ${error.message}`);
-      throw error;
+      if (isPending) throw error;
     }
   }
 
@@ -468,7 +561,17 @@ export default function App() {
 
     for (const item of group.groupKeys) {
       const pin = pinKey(item.username, item.publicKey);
-      if(pin.status === 'changed') acceptNewKey(item.username, item.publicKey); 
+      if (pin.status === 'changed') {
+        if (item.username === me.userID) {
+          acceptNewKey(item.username, item.publicKey);
+          continue;
+        }
+        const accept = window.confirm(
+          `A chave pública de "${item.username}" mudou.\n\nNovo Fingerprint: ${fingerprint(item.publicKey)}\n\nAceitar a nova chave?`
+        );
+        if (!accept) throw new Error(`A chave pública de ${item.username} mudou e o envio foi cancelado.`);
+        acceptNewKey(item.username, item.publicKey);
+      }
     }
 
     const encryptedPacket = await runCrypto('encryptForGroup', draft, group.groupID, group.groupKeys, me.privateKey, me.userID);
@@ -506,7 +609,6 @@ export default function App() {
       setTarget('');
       targetRef.current = '';
       setActiveGroupID(newGroup.groupID);
-      setGroupID(newGroup.groupID);
       setGroupMembers('');
       setNotice(`Grupo criado.`);
     } catch (error) {
@@ -579,6 +681,13 @@ export default function App() {
             <div><span className="key-label">Fingerprint (confirme com seus contatos)</span><code>{fingerprint(identity.publicKey)}</code></div>
             <p>A sua chave e histórico estão protegidos usando AES-GCM (Proteção contra XSS e exfiltração física).</p>
             <button className="secondary" onClick={reconnect} disabled={busy}>Reconectar Sessão</button>
+            <details className="import-details">
+              <summary>Trocar chave de identidade</summary>
+              <p className="muted">A chave atual assina a nova chave. As mensagens antigas deixam de ser decifráveis e não é possível trocar a chave se você criou grupos.</p>
+              <label>Palavra-passe atual<input type="password" value={currentPassword} onChange={e => setCurrentPassword(e.target.value)} placeholder="Palavra-passe atual" /></label>
+              <label>Nova palavra-passe<input type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)} placeholder="Mínimo 3 caracteres" /></label>
+              <button className="secondary" onClick={rotateIdentity} disabled={busy || !currentPassword || newPassword.length < 3}>Gerar nova chave</button>
+            </details>
           </div>
         )}
       </section>
@@ -633,7 +742,7 @@ export default function App() {
                   </li>
                 ))}
               </ul>
-            ) : (<p className="muted">Exibição global de rede desativada por privacidade.</p>)}
+            ) : (<p className="muted">Nenhum usuário online.</p>)}
           </section>
 
           <section className="panel group-panel">
@@ -697,7 +806,7 @@ export default function App() {
           </div>
 
           <form className="composer" onSubmit={sendMessage}>
-            <textarea value={draft} onChange={e => setDraft(e.target.value)} placeholder="Digite uma mensagem " rows={3} disabled={(!target && !activeGroupID) || busy || isLocked} />
+            <textarea value={draft} onChange={e => setDraft(e.target.value)} placeholder="Digite uma mensagem" rows={3} disabled={(!target && !activeGroupID) || busy || isLocked} />
             <div className="composer-footer">
               <button disabled={busy || (!target && !activeGroupID) || !draft.trim() || isLocked}>Cifrar e enviar ↗</button>
             </div>

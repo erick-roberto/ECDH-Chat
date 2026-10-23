@@ -1,5 +1,5 @@
 const {
-    users, publicKeys, groups, allowed, reply, isValidID, isPointHex,
+    users, publicKeys, groups, allowed, reply, isHex, isValidID, isPointHex,
     isSignatureHex, isMessageID, isTimestamp, sortedMembers, verifySignature,
     GROUP_GRANT_DOMAIN, MAX_GROUP_SIZE, PROTOCOL_VERSION, GROUP_ALGORITHM,
     GROUP_DOMAIN
@@ -7,10 +7,18 @@ const {
 const { persistGroup, persistGroupMessages, markMessagesDelivered } = require('../../database');
 const { findSocketID, groupPublicData } = require('../delivery');
 
-const isHex = val => typeof val === 'string' && /^[0-9a-f]+$/i.test(val);
-
 module.exports = function register(socket, io) {
-    socket.on('create_group', async ({ groupID, members, signature } = {}, callback) => {
+    socket.on('create_group', async (payload, callback) => {
+        if (!allowed(socket)) return reply(callback, { success: false, message: 'Muitas requisições.' });
+
+        const { groupID, members, signature } = payload || {};
+        const creator = users.get(socket.id);
+        if (!creator) return reply(callback, { success: false, message: 'Registre sua chave pública primeiro.' });
+        if (!isMessageID(groupID) || !Array.isArray(members) || !isSignatureHex(signature)) {
+            return reply(callback, { success: false, message: 'Parâmetros do grupo inválidos.' });
+        }
+        if (!members.every(isValidID)) return reply(callback, { success: false, message: 'Membros inválidos.' });
+
         const uniqueMembers = sortedMembers(members.map(id => id.trim()));
         if (!uniqueMembers.includes(creator.userID)) return reply(callback, { success: false, message: 'O criador deve fazer parte do grupo.' });
         if (uniqueMembers.length < 2 || uniqueMembers.length > MAX_GROUP_SIZE) return reply(callback, { success: false, message: 'Tamanho inválido.' });
@@ -26,6 +34,7 @@ module.exports = function register(socket, io) {
             await persistGroup(groupID, group);
             groups.set(groupID, group);
         } catch (error) {
+            console.error('Erro ao persistir grupo:', error.message);
             return reply(callback, { success: false, message: 'Falha no banco.' });
         }
         
@@ -44,14 +53,13 @@ module.exports = function register(socket, io) {
 
         if (
             !payload || !isMessageID(payload.groupID) || !isPointHex(payload.ePub) ||
-            !isHex(payload.iv) || !isHex(payload.ciphertext) ||
+            !isHex(payload.iv, 24) || !isHex(payload.ciphertext) ||
             !isMessageID(payload.messageId) || !isTimestamp(payload.sentAt) ||
             !Array.isArray(payload.encryptedBlocks) || payload.encryptedBlocks.length > MAX_GROUP_SIZE
         ) {
             return reply(callback, { success: false, message: 'Payload de grupo inválido.' });
         }
 
-        // Validação de Frescor (Replay)
         if (Math.abs(Date.now() - payload.sentAt) > 300000) {
             return reply(callback, { success: false, message: 'Mensagem de grupo expirada.' });
         }
@@ -69,16 +77,16 @@ module.exports = function register(socket, io) {
 
         const blockByUser = new Map();
         const senderPubKey = publicKeys.get(sender.userID);
+        if (!senderPubKey) return reply(callback, { success: false, message: 'Remetente desconhecido.' });
 
         for (const block of blocks) {
-            if (!block || !isValidID(block.username) || !isHex(block.wrappedKey) || !isSignatureHex(block.signature)) {
+            if (!block || !isValidID(block.username) || !isHex(block.wrappedKey, 64) || !isSignatureHex(block.signature)) {
                 return reply(callback, { success: false, message: 'Bloco cifrado inválido.' });
             }
             if (block.username === sender.userID || !expectedRecipients.includes(block.username) || blockByUser.has(block.username)) {
                 return reply(callback, { success: false, message: 'Destinatário duplicado/inválido.' });
             }
 
-            // Validação de Assinatura ECDSA em lote no Servidor
             const unsignedFields = [
                 payload.version, payload.algorithm, payload.groupID, sender.userID,
                 block.username, payload.messageId, payload.sentAt, payload.ePub,
@@ -120,6 +128,7 @@ module.exports = function register(socket, io) {
             }
             return reply(callback, { success: true, delivered: deliveredCount, queued: queuedCount, failed: 0 });
         } catch (error) {
+            console.error('Erro ao persistir mensagem de grupo:', error.message);
             return reply(callback, { success: false, message: 'Falha no banco.' });
         }
     });

@@ -25,18 +25,12 @@ function hexToBytes(hex) {
 function bigintToBytes(n, length) {
   return hexToBytes(n.toString(16).padStart(length * 2, '0'));
 }
-function concat(...arrays) {
-  const out = new Uint8Array(arrays.reduce((sum, a) => sum + a.length, 0));
-  let offset = 0;
-  for (const a of arrays) { out.set(a, offset); offset += a.length; }
-  return out;
-}
 
-// Domínios de Assinatura
 const DIRECT_DOMAIN = 'chat-ecc/direct/v3';
 const GROUP_DOMAIN = 'chat-ecc/group/v3';
 const REGISTER_DOMAIN = 'chat-ecc/register/v1';
 const GROUP_GRANT_DOMAIN = 'chat-ecc/group-grant/v1';
+const KEY_ROTATION_DOMAIN = 'chat-ecc/key-rotation/v1';
 
 function signedBytes(domain, fields) {
   return new TextEncoder().encode(`${domain}\n${JSON.stringify(fields)}`);
@@ -76,12 +70,10 @@ export function createIdentity() {
   return { privateKey, publicKey };
 }
 
-// Novos Algoritmos Híbridos
 export const DIRECT_ALGORITHM = 'Hybrid-ECDHE-AES256GCM-direct-v3';
 export const GROUP_ALGORITHM = 'Hybrid-ECDHE-AES256GCM-group-v3';
 export const PROTOCOL_VERSION = 3;
 
-// A estrutura do pacote mudou: saiu c1/c2, entrou ePub, iv e ciphertext
 const directFields = p => [
   p.version, p.algorithm, p.senderID, p.receiverID, p.messageId, p.sentAt, p.ePub, p.iv, p.ciphertext
 ];
@@ -89,18 +81,14 @@ const groupFields = p => [
   p.version, p.algorithm, p.groupID, p.senderID, p.receiverID, p.messageId, p.sentAt, p.ePub, p.iv, p.ciphertext, p.wrappedKey
 ];
 
-/* ---------- Mensagens Diretas (ECDHE + AES-GCM) ---------- */
 
 export async function encryptForRecipient(text, recipientPublicKeyHex, senderPrivateKeyHex, senderID, receiverID) {
-  // 1. ECDHE: Gera chave efêmera para esta mensagem (Garante PFS)
   const ePriv = randomScalar();
   const ePub = Point.BASE.multiply(ePriv).toHex(true);
 
-  // 2. Calcula o Segredo Partilhado com o destinatário
   const sharedSecret = secp256k1.getSharedSecret(bigintToBytes(ePriv, 32), hexToBytes(recipientPublicKeyHex));
-  const aesKeyMaterial = sha256(sharedSecret); // Deriva chave de 32 bytes (256 bits)
+  const aesKeyMaterial = sha256(sharedSecret);
 
-  // 3. AES-GCM: Cifra a mensagem (Tamanho ilimitado)
   const cryptoKey = await crypto.subtle.importKey('raw', aesKeyMaterial, { name: 'AES-GCM' }, false, ['encrypt']);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const encodedText = new TextEncoder().encode(text);
@@ -118,7 +106,6 @@ export async function encryptForRecipient(text, recipientPublicKeyHex, senderPri
     ciphertext: bytesToHex(new Uint8Array(cipherBuffer))
   };
 
-  // 4. Assina o pacote com a chave de Identidade para provar a autoria
   const signature = signFields(DIRECT_DOMAIN, directFields(unsigned), senderPrivateKeyHex);
   return { ...unsigned, signature };
 }
@@ -130,16 +117,13 @@ export async function decryptAndVerify(packet, recipientPrivateKeyHex, senderPub
   
   checkEnvelope(packet);
 
-  // 1. Verifica Assinatura
   if (!verifyFields(DIRECT_DOMAIN, directFields(packet), packet.signature, senderPublicKeyHex)) {
     throw new Error('Assinatura inválida. Mensagem descartada.');
   }
 
-  // 2. ECDHE: Calcula o Segredo Partilhado usando a chave privada e a ePub recebida
   const sharedSecret = secp256k1.getSharedSecret(hexToBytes(recipientPrivateKeyHex), hexToBytes(packet.ePub));
   const aesKeyMaterial = sha256(sharedSecret);
 
-  // 3. AES-GCM: Decifra a mensagem
   const cryptoKey = await crypto.subtle.importKey('raw', aesKeyMaterial, { name: 'AES-GCM' }, false, ['decrypt']);
   try {
     const plainBuffer = await crypto.subtle.decrypt(
@@ -157,12 +141,10 @@ export async function decryptAndVerify(packet, recipientPrivateKeyHex, senderPub
   }
 }
 
-/* ---------- Mensagens de Grupo (AES Envelope + ECDHE) ---------- */
 
 export async function encryptForGroup(text, groupID, recipients, senderPrivateKeyHex, senderID) {
   if (!Array.isArray(recipients) || recipients.length === 0) throw new Error('O grupo está vazio.');
 
-  // 1. Gera uma Chave AES aleatória apenas para esta mensagem e cifra o texto 1 vez
   const messageAesKey = crypto.getRandomValues(new Uint8Array(32));
   const cryptoKey = await crypto.subtle.importKey('raw', messageAesKey, { name: 'AES-GCM' }, false, ['encrypt']);
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -170,20 +152,17 @@ export async function encryptForGroup(text, groupID, recipients, senderPrivateKe
   const ciphertextHex = bytesToHex(new Uint8Array(cipherBuffer));
   const ivHex = bytesToHex(iv);
 
-  // 2. Gera a Chave Efêmera do Grupo
   const ePriv = randomScalar();
   const ePub = Point.BASE.multiply(ePriv).toHex(true);
   const messageId = newMessageId();
   const sentAt = Date.now();
 
-  // 3. Embrulha a chave AES para cada membro do grupo
   const encryptedBlocks = recipients
     .filter(recipient => recipient.username !== senderID)
     .map(recipient => {
       const sharedSecret = secp256k1.getSharedSecret(bigintToBytes(ePriv, 32), hexToBytes(recipient.publicKey));
-      const kek = sha256(sharedSecret); // Key Encryption Key
+      const kek = sha256(sharedSecret);
       
-      // Encripta a chave AES fazendo um XOR com o KEK gerado via ECDHE
       const wrappedKey = new Uint8Array(32);
       for (let i = 0; i < 32; i++) wrappedKey[i] = messageAesKey[i] ^ kek[i];
       const wrappedKeyHex = bytesToHex(wrappedKey);
@@ -220,15 +199,14 @@ export async function decryptGroupAndVerify(packet, recipientPrivateKeyHex, send
     throw new Error('Assinatura do grupo inválida.');
   }
 
-  // 1. Calcula o Segredo Partilhado e recupera a chave AES
   const sharedSecret = secp256k1.getSharedSecret(hexToBytes(recipientPrivateKeyHex), hexToBytes(packet.ePub));
   const kek = sha256(sharedSecret);
   
   const wrappedKey = hexToBytes(packet.wrappedKey);
+  if (wrappedKey.length !== 32) throw new Error('Chave embrulhada inválida.');
   const messageAesKey = new Uint8Array(32);
   for (let i = 0; i < 32; i++) messageAesKey[i] = wrappedKey[i] ^ kek[i];
 
-  // 2. Decifra a mensagem com a chave AES recuperada
   const cryptoKey = await crypto.subtle.importKey('raw', messageAesKey, { name: 'AES-GCM' }, false, ['decrypt']);
   try {
     const plainBuffer = await crypto.subtle.decrypt(
@@ -254,6 +232,9 @@ const sortedMembers = members => [...new Set(members)].sort();
 export function signGroupGrant(privateKeyHex, groupID, members, createdBy) {
   return signFields(GROUP_GRANT_DOMAIN, [groupID, sortedMembers(members), createdBy], privateKeyHex);
 }
+export function signKeyRotation(privateKeyHex, userID, previousPublicKey, newPublicKey, nonce) {
+  return signFields(KEY_ROTATION_DOMAIN, [userID, previousPublicKey, newPublicKey, nonce], privateKeyHex);
+}
 export function verifyGroupGrant(group, creatorPublicKey) {
   if (!group?.signature) return false;
   return verifyFields(GROUP_GRANT_DOMAIN, [group.groupID, sortedMembers(group.members), group.createdBy], group.signature, creatorPublicKey);
@@ -263,8 +244,13 @@ export function fingerprint(publicKeyHex) {
   return digest.match(/.{4}/g).join(' ');
 }
 export function validatePrivateKey(hex) {
-  const bytes = hexToBytes(hex);
-  if (bytes.length !== 32) throw new Error('Chave privada inválida.');
+  if (typeof hex !== 'string' || !/^[0-9a-f]{64}$/i.test(hex)) {
+    throw new Error('Chave privada inválida.');
+  }
+  const scalar = BigInt('0x' + hex);
+  if (scalar <= 0n || scalar >= CURVE_ORDER) {
+    throw new Error('Chave privada fora do intervalo da curva.');
+  }
   return true;
 }
 export function publicFromPrivate(hex) {

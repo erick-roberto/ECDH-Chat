@@ -44,13 +44,10 @@ async function persistDirectMessage(packet) {
             packet.receiverID,
             packet.algorithm,
             packet.version,
-            packet.c1,
-            packet.c2,
+            packet.ePub,
+            packet.ciphertext,
             packet.signature,
-            JSON.stringify({
-                sentAt: packet.sentAt,
-                timestamp: packet.timestamp,
-            }),
+            JSON.stringify(packet),
         ]
     );
 
@@ -109,8 +106,8 @@ async function persistGroupMessages(packets) {
                     compactHexToUuid(packet.groupID),
                     packet.algorithm,
                     packet.version,
-                    packet.c1,
-                    packet.c2,
+                    packet.ePub,
+                    packet.ciphertext,
                     packet.signature,
                     JSON.stringify(packet),
                 ]
@@ -144,6 +141,11 @@ async function getPendingMessages(userID) {
             sender_id,
             receiver_id,
             group_id,
+            algorithm,
+            version,
+            c1,
+            c2,
+            signature,
             encrypted_payload,
             created_at
         FROM messages
@@ -156,15 +158,22 @@ async function getPendingMessages(userID) {
 
     return result.rows.map(row => {
         const payload = row.encrypted_payload ?? {};
+        const createdAt = new Date(row.created_at).getTime();
 
         const packet = {
             ...payload,
             type: row.message_type,
+            version: row.version ?? payload.version,
+            algorithm: row.algorithm ?? payload.algorithm,
             senderID: row.sender_id,
             receiverID: row.receiver_id,
             messageId: uuidToCompactHex(row.message_id),
-            timestamp: payload.timestamp
-                ?? new Date(row.created_at).getTime(),
+            ePub: payload.ePub ?? row.c1,
+            iv: payload.iv,
+            ciphertext: payload.ciphertext ?? row.c2,
+            signature: payload.signature ?? row.signature,
+            sentAt: Number(payload.sentAt ?? createdAt),
+            timestamp: payload.timestamp ?? createdAt,
         };
 
         if (row.group_id) {
@@ -198,8 +207,20 @@ async function markMessagesDelivered(messageIDs, receiverID) {
 }
 
 
-async function getDirectHistory(userID, peerID) {
-    const result = await pool.query(
+async function discardPendingMessages(receiverID) {
+    await pool.query(
+        `
+        UPDATE messages
+        SET delivery_status = 'delivered',
+            delivered_at = NOW()
+        WHERE receiver_id = $1
+          AND delivery_status = 'pending'
+        `,
+        [receiverID]
+    );
+}
+
+async function getDirectHistory(userID, peerID) {    const result = await pool.query(
         `
         SELECT
             id,
@@ -225,20 +246,26 @@ async function getDirectHistory(userID, peerID) {
         [userID, peerID]
     );
 
-    return result.rows.map(row => ({
-        type: 'direct',
-        version: row.version,
-        algorithm: row.algorithm,
-        senderID: row.sender_id,
-        receiverID: row.receiver_id,
-        messageId: row.message_id.replace(/-/g, ''),
-        sentAt: Number(row.encrypted_payload.sentAt),
-        c1: row.c1,
-        c2: row.c2,
-        signature: row.signature,
-        timestamp: row.encrypted_payload.timestamp
-            ?? new Date(row.created_at).getTime(),
-    }));
+    return result.rows.map(row => {
+        const payload = row.encrypted_payload ?? {};
+        const createdAt = new Date(row.created_at).getTime();
+
+        return {
+            ...payload,
+            type: 'direct',
+            version: row.version,
+            algorithm: row.algorithm,
+            senderID: row.sender_id,
+            receiverID: row.receiver_id,
+            messageId: uuidToCompactHex(row.message_id),
+            ePub: payload.ePub ?? row.c1,
+            iv: payload.iv,
+            ciphertext: payload.ciphertext ?? row.c2,
+            signature: payload.signature ?? row.signature,
+            sentAt: Number(payload.sentAt ?? createdAt),
+            timestamp: payload.timestamp ?? createdAt,
+        };
+    });
 }
 
 module.exports = {
@@ -246,5 +273,6 @@ module.exports = {
     persistGroupMessages,
     getPendingMessages,
     markMessagesDelivered,
+    discardPendingMessages,
     getDirectHistory,
 };

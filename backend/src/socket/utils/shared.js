@@ -6,8 +6,11 @@ const MAX_GROUP_SIZE = 100;
 const PROTOCOL_VERSION = 3;
 const DIRECT_ALGORITHM = 'Hybrid-ECDHE-AES256GCM-direct-v3';
 const GROUP_ALGORITHM = 'Hybrid-ECDHE-AES256GCM-group-v3';
+const DIRECT_DOMAIN = 'chat-ecc/direct/v3';
+const GROUP_DOMAIN = 'chat-ecc/group/v3';
 const REGISTER_DOMAIN = 'chat-ecc/register/v1';
 const GROUP_GRANT_DOMAIN = 'chat-ecc/group-grant/v1';
+const KEY_ROTATION_DOMAIN = 'chat-ecc/key-rotation/v1';
 const RATE_WINDOW_MS = 10_000;
 const RATE_MAX_EVENTS = 40;
 
@@ -20,7 +23,11 @@ function isValidID(value) {
 }
 
 const isHex = (value, length) =>
-    typeof value === 'string' && value.length === length && /^[0-9a-f]+$/i.test(value);
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length % 2 === 0 &&
+    (length === undefined || value.length === length) &&
+    /^[0-9a-f]+$/i.test(value);
 const isPointHex = value => isHex(value, 66);
 const isSignatureHex = value => isHex(value, 128);
 const isMessageID = value => isHex(value, 32);
@@ -69,7 +76,7 @@ function onlineUserIDs() {
 module.exports = {
     users, publicKeys, groups,
     MAX_GROUP_SIZE, PROTOCOL_VERSION, DIRECT_ALGORITHM, GROUP_ALGORITHM,
-    REGISTER_DOMAIN, GROUP_GRANT_DOMAIN,
-    reply, isValidID, isPointHex, isSignatureHex, isMessageID, isTimestamp,
+    DIRECT_DOMAIN, GROUP_DOMAIN, REGISTER_DOMAIN, GROUP_GRANT_DOMAIN, KEY_ROTATION_DOMAIN,
+    reply, isValidID, isHex, isPointHex, isSignatureHex, isMessageID, isTimestamp,
     isValidPublicKey, verifySignature, allowed, sortedMembers, findSocketID, onlineUserIDs,
 };

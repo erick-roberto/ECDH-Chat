@@ -1,12 +1,10 @@
 const {
-    users, publicKeys, allowed, reply, isValidID, isPointHex, isSignatureHex,
+    users, publicKeys, allowed, reply, isHex, isValidID, isPointHex, isSignatureHex,
     isMessageID, isTimestamp, PROTOCOL_VERSION, DIRECT_ALGORITHM,
     verifySignature, DIRECT_DOMAIN
 } = require('../utils/shared');
 const { persistDirectMessage, markMessagesDelivered, getDirectHistory } = require('../../database');
 const { findSocketID } = require('../delivery');
-
-const isHex = val => typeof val === 'string' && /^[0-9a-f]+$/i.test(val);
 
 module.exports = function register(socket, io) {
     socket.on('send_encrypted_message', async (payload, callback) => {
@@ -15,22 +13,22 @@ module.exports = function register(socket, io) {
         if (!allowed(socket)) return reply(callback, { success: false, message: 'Muitas requisições.' });
 
         const valid =
-            payload && isValidID(payload.receiverID) && payload.version === PROTOCOL_VERSION &&
+            payload && isValidID(payload.receiverID) && payload.receiverID !== sender.userID &&
+            payload.version === PROTOCOL_VERSION &&
             payload.algorithm === DIRECT_ALGORITHM && payload.senderID === sender.userID &&
             isMessageID(payload.messageId) && isTimestamp(payload.sentAt) &&
-            isPointHex(payload.ePub) && isHex(payload.iv) && isHex(payload.ciphertext) &&
+            isPointHex(payload.ePub) && isHex(payload.iv, 24) && isHex(payload.ciphertext) &&
             isSignatureHex(payload.signature);
 
         if (!valid) return reply(callback, { success: false, message: 'Pacote Híbrido estruturalmente inválido.' });
         if (!publicKeys.has(payload.receiverID)) return reply(callback, { success: false, message: 'Destinatário desconhecido.' });
 
-        // Validação de Frescor (Replay no Servidor)
         if (Math.abs(Date.now() - payload.sentAt) > 300000) {
             return reply(callback, { success: false, message: 'Carimbo de tempo expirado (Replay).' });
         }
 
-        // Validação de Assinatura ECDSA (Prevenção de Fila Envenenada)
         const senderPubKey = publicKeys.get(sender.userID);
+        if (!senderPubKey) return reply(callback, { success: false, message: 'Remetente desconhecido.' });
         const unsignedFields = [
             payload.version, payload.algorithm, payload.senderID, payload.receiverID,
             payload.messageId, payload.sentAt, payload.ePub, payload.iv, payload.ciphertext
@@ -59,11 +57,13 @@ module.exports = function register(socket, io) {
 
             return reply(callback, { success: true, delivered: false, queued: true, message: 'Na fila offline segura.' });
         } catch (error) {
+            console.error('Erro ao persistir mensagem direta:', error.message);
             return reply(callback, { success: false, message: 'Falha no banco de dados.' });
         }
     });
 
-    socket.on('request_direct_history', async ({ peerID } = {}, callback) => {
+    socket.on('request_direct_history', async (payload, callback) => {
+        const { peerID } = payload || {};
         const currentUser = users.get(socket.id);
         if (!currentUser) return reply(callback, { success: false, message: 'Registre sua chave primeiro.' });
         if (!allowed(socket)) return reply(callback, { success: false, message: 'Muitas requisições.' });
@@ -73,6 +73,7 @@ module.exports = function register(socket, io) {
             const history = await getDirectHistory(currentUser.userID, peerID);
             return reply(callback, { success: true, peerID, messages: history });
         } catch (error) {
+            console.error('Erro ao recuperar histórico:', error.message);
             return reply(callback, { success: false, message: 'Falha ao recuperar histórico.' });
         }
     });

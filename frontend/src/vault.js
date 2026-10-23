@@ -40,13 +40,13 @@ export async function saveIdentitySecurely(identity, password) {
 export async function loadIdentitySecurely(password) {
   const payloadStr = localStorage.getItem(DATA_KEY);
   if (!payloadStr) return null;
-  
-  const payload = JSON.parse(payloadStr);
-  const key = await getEncryptionKey(password);
-  const iv = new Uint8Array(payload.iv.match(/.{1,2}/g).map(b => parseInt(b, 16)));
-  const encrypted = new Uint8Array(payload.data.match(/.{1,2}/g).map(b => parseInt(b, 16)));
-  
+
   try {
+    const payload = JSON.parse(payloadStr);
+    const key = await getEncryptionKey(password);
+    const iv = new Uint8Array(payload.iv.match(/.{1,2}/g).map(b => parseInt(b, 16)));
+    const encrypted = new Uint8Array(payload.data.match(/.{1,2}/g).map(b => parseInt(b, 16)));
+
     const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, encrypted);
     return JSON.parse(DECODER.decode(decrypted));
   } catch (e) {

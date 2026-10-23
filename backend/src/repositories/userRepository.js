@@ -25,8 +25,9 @@ async function persistUserPublicKey(userID, publicKey) {
         )
         VALUES ($1, $2, NOW(), NOW())
         ON CONFLICT (user_id)
-        DO UPDATE SET updated_at = NOW()
-        WHERE users.public_key = EXCLUDED.public_key
+        DO UPDATE SET
+            public_key = EXCLUDED.public_key,
+            updated_at = NOW()
         RETURNING user_id, public_key
         `,
         [userID, publicKey]

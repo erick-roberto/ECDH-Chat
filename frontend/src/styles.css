@@ -76,8 +76,6 @@ button:disabled {
   padding: 24px;
 }
 
-/* Cabeçalho */
-
 .topbar {
   display: flex;
   align-items: center;
@@ -141,8 +139,6 @@ button:disabled {
   background: #72f0a6;
 }
 
-/* Cartões e títulos */
-
 .panel {
   min-width: 0;
   padding: 22px;
@@ -188,8 +184,6 @@ button:disabled {
   border-radius: 999px;
   font-size: 11px;
 }
-
-/* Identidade e campos */
 
 .identity-grid {
   display: grid;
@@ -296,8 +290,6 @@ textarea:focus {
   margin-bottom: 10px;
 }
 
-/* Área principal */
-
 .content-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.65fr) minmax(280px, 1fr);
@@ -308,8 +300,6 @@ textarea:focus {
 .chat-panel > label {
   margin-bottom: 15px;
 }
-
-/* Histórico de mensagens */
 
 .message-list {
   height: 390px;
@@ -365,8 +355,6 @@ textarea:focus {
   line-height: 1.6;
 }
 
-/* Balões */
-
 .message {
   max-width: min(82%, 460px);
   align-self: flex-start;
@@ -400,8 +388,6 @@ textarea:focus {
   white-space: pre-wrap;
 }
 
-/* Campo de envio */
-
 .composer {
   margin-top: 14px;
 }
@@ -424,8 +410,6 @@ textarea:focus {
   color: var(--muted);
   font-size: 10px;
 }
-
-/* Usuários e grupos */
 
 .side-column {
   display: grid;
@@ -505,8 +489,6 @@ textarea:focus {
   border-radius: 10px;
 }
 
-/* Avisos */
-
 .notice {
   display: flex;
   justify-content: space-between;
@@ -541,8 +523,6 @@ footer {
   text-align: center;
 }
 
-/* Tablets */
-
 @media (max-width: 900px) {
   .shell {
     padding: 16px;
@@ -564,8 +544,6 @@ footer {
     flex: 1;
   }
 }
-
-/* Celulares */
 
 @media (max-width: 560px) {
   .shell {
@@ -653,11 +631,6 @@ footer {
     width: 100%;
   }
 }
-
-
-/* =========================================
-   Lista de conversas e busca
-   ========================================= */
 
 .content-grid {
   grid-template-columns: minmax(270px, 340px) minmax(0, 1fr);
@@ -868,8 +841,6 @@ footer {
   white-space: nowrap;
 }
 
-/* Cabeçalho da conversa selecionada */
-
 .chat-panel {
   display: flex;
   flex-direction: column;
@@ -928,8 +899,6 @@ footer {
   margin-top: 14px;
 }
 
-/* Ajustes para telas menores */
-
 @media (max-width: 900px) {
   .content-grid {
     grid-template-columns: minmax(0, 1fr);
@@ -983,8 +952,6 @@ footer {
     height: 330px;
   }
 }
-
-/* Lista de grupos */
 
 .group-conversation-list {
   display: grid;

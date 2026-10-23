@@ -1,10 +1,12 @@
 const crypto = require('crypto');
 const {
-    users, publicKeys, allowed, reply, isValidID, isValidPublicKey,
-    isSignatureHex, verifySignature, REGISTER_DOMAIN,
+    users, publicKeys, groups, allowed, reply, isValidID, isValidPublicKey,
+    isSignatureHex, verifySignature, REGISTER_DOMAIN, KEY_ROTATION_DOMAIN, onlineUserIDs,
 } = require('../utils/shared');
-const { persistUserPublicKey, loadPersistedGroups } = require('../../database');
-const { flushQueue, sendGroupsToUser } = require('../delivery');
+const {
+    persistUserPublicKey, getPersistedPublicKey, loadPersistedGroups, discardPendingMessages,
+} = require('../../database');
+const { flushQueue, sendGroupsToUser, findSocketID, groupPublicData } = require('../delivery');
 
 module.exports = function register(socket, io) {
     socket.on('get_auth_challenge', (_payload, callback) => {
@@ -15,8 +17,11 @@ module.exports = function register(socket, io) {
         reply(callback, { success: true, nonce });
     });
 
-    socket.on('register_public_key', async ({ userID, publicKey, signature } = {}, callback) => {
+    socket.on('register_public_key', async (payload, callback) => {
         if (!allowed(socket)) return reply(callback, { success: false, message: 'Muitas requisições.' });
+
+        const { userID, publicKey, signature, previousPublicKey, rotationSignature } = payload || {};
+
         if (!isValidID(userID) || !isValidPublicKey(publicKey) || !isSignatureHex(signature)) {
             return reply(callback, { success: false, message: 'Parâmetros inválidos.' });
         }
@@ -28,10 +33,37 @@ module.exports = function register(socket, io) {
             return reply(callback, { success: false, message: 'Falha na autenticação do desafio.' });
         }
 
-        // Mitigação TOFU Incompleto: Removido o bloqueio rígido de substituição de chaves.
-        // O cliente agora confia na notificação visual de mudança de PIN.
-
         try {
+            const existingKey = publicKeys.get(userID) ?? await getPersistedPublicKey(userID);
+            const isRotation = Boolean(existingKey) && existingKey !== publicKey;
+
+            if (isRotation) {
+                const rotationValid =
+                    previousPublicKey === existingKey &&
+                    isSignatureHex(rotationSignature) &&
+                    verifySignature(
+                        KEY_ROTATION_DOMAIN,
+                        [userID, previousPublicKey, publicKey, nonce],
+                        rotationSignature,
+                        existingKey
+                    );
+
+                if (!rotationValid) {
+                    return reply(callback, {
+                        success: false,
+                        message: 'Troca de chave recusada: assine a nova chave com a chave privada atual.',
+                    });
+                }
+
+                const createsGroups = [...groups.values()].some(group => group.createdBy === userID);
+                if (createsGroups) {
+                    return reply(callback, {
+                        success: false,
+                        message: 'Troca de chave recusada: recrie primeiro os grupos que você criou.',
+                    });
+                }
+            }
+
             await loadPersistedGroups();
             const persistedUser = await persistUserPublicKey(userID, publicKey);
 
@@ -42,10 +74,24 @@ module.exports = function register(socket, io) {
 
             reply(callback, { success: true });
 
-            // Mitigação de Privacidade: A lista global de IDs online já não é transmitida.
-            // io.emit('user_list_update', onlineUserIDs()); 
+            io.emit('user_list_update', onlineUserIDs());
 
             sendGroupsToUser(socket, userID);
+
+            if (isRotation) {
+                await discardPendingMessages(userID);
+
+                for (const [groupID, group] of groups.entries()) {
+                    if (!group.members.includes(userID)) continue;
+
+                    const data = groupPublicData(groupID, group);
+                    for (const memberID of group.members) {
+                        const memberSocketID = findSocketID(memberID);
+                        if (memberSocketID) io.to(memberSocketID).emit('group_created', data);
+                    }
+                }
+            }
+
             flushQueue(socket, userID);
         } catch (error) {
             console.error('Erro ao persistir usuário:', error.message);

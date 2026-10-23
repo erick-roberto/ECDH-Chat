@@ -1,8 +1,10 @@
 
 const { pool } = require('../config/database');
 const { publicKeys } = require('../state/runtimeState');
+const { logEvent, logError } = require('../utils/logger');
 
 async function loadPersistedPublicKeys() {
+    logEvent('DATABASE', 'Carregando chaves públicas persistidas');
     const result = await pool.query(`
         SELECT user_id, public_key
         FROM users
@@ -14,10 +16,11 @@ async function loadPersistedPublicKeys() {
         publicKeys.set(row.user_id, row.public_key);
     }
 
-    console.log(`Chaves públicas carregadas: ${result.rowCount}`);
+    logEvent('DATABASE', 'Chaves públicas carregadas para memória', { count: result.rowCount, users: result.rows.map(row => ({ userID: row.user_id, publicKey: row.public_key })) });
 }
 
 async function persistUserPublicKey(userID, publicKey) {
+    logEvent('DATABASE', 'Persistindo/validando chave pública do usuário', { userID, publicKey });
     const result = await pool.query(
         `
         INSERT INTO users (
@@ -32,10 +35,12 @@ async function persistUserPublicKey(userID, publicKey) {
         [userID, publicKey]
     );
 
+    logEvent('DATABASE', 'Resultado da persistência da chave pública', { userID, success: Boolean(result.rows[0]), row: result.rows[0] || null });
     return result.rows[0] || null;
 }
 
 async function getPersistedPublicKey(userID) {
+    logEvent('DATABASE', 'Consultando chave pública', { userID });
     const result = await pool.query(
         `
         SELECT public_key
@@ -45,7 +50,9 @@ async function getPersistedPublicKey(userID) {
         [userID]
     );
 
-    return result.rows[0]?.public_key || null;
+    const publicKey = result.rows[0]?.public_key || null;
+    logEvent('DATABASE', 'Consulta de chave pública concluída', { userID, found: Boolean(publicKey), publicKey });
+    return publicKey;
 }
 
 module.exports = {

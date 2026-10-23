@@ -1,12 +1,14 @@
 
 const { pool } = require('../config/database');
 const { groups } = require('../state/runtimeState');
+const { logEvent, logError } = require('../utils/logger');
 const {
     compactHexToUuid,
     uuidToCompactHex,
 } = require('../utils/identifiers');
 
 async function persistGroup(groupID, group) {
+    logEvent('DATABASE', 'Persistindo grupo e membros', { groupID, createdBy: group.createdBy, members: group.members, signature: group.signature });
     const databaseGroupID = compactHexToUuid(groupID);
     const client = await pool.connect();
 
@@ -40,8 +42,10 @@ async function persistGroup(groupID, group) {
         }
 
         await client.query('COMMIT');
+        logEvent('DATABASE', 'Grupo persistido com sucesso', { groupID, createdBy: group.createdBy, memberCount: group.members.length });
     } catch (error) {
         await client.query('ROLLBACK');
+        logError('DATABASE', 'Transação de grupo revertida', error, { groupID });
         throw error;
     } finally {
         client.release();
@@ -51,6 +55,7 @@ async function persistGroup(groupID, group) {
 let persistedGroupsLoadPromise = null;
 
 async function loadPersistedGroups() {
+    logEvent('DATABASE', 'Solicitação para carregar grupos persistidos');
     if (persistedGroupsLoadPromise) {
         return persistedGroupsLoadPromise;
     }
@@ -94,7 +99,7 @@ async function loadPersistedGroups() {
             groups.set(groupID, group);
         }
 
-        console.log(`Grupos carregados do PostgreSQL: ${groups.size}`);
+        logEvent('DATABASE', 'Grupos carregados do PostgreSQL', { count: groups.size, groups: [...groups.entries()].map(([groupID, group]) => ({ groupID, ...group })) });
     })();
 
     try {

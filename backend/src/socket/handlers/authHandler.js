@@ -5,6 +5,7 @@ const {
 } = require('../utils/shared');
 const { persistUserPublicKey, loadPersistedGroups } = require('../../database');
 const { flushQueue, sendGroupsToUser } = require('../delivery');
+const { logEvent, logError } = require('../../utils/logger');
 module.exports = function register(socket, io) {
     socket.on('get_auth_challenge', (_payload, callback) => {
                 if (!allowed(socket)) {
@@ -12,6 +13,7 @@ module.exports = function register(socket, io) {
                 }
 
                 const nonce = crypto.randomBytes(32).toString('hex');
+                logEvent('AUTH', 'Desafio de autenticação gerado', { socketID: socket.id });
                 socket.data.nonce = nonce;
                 reply(callback, { success: true, nonce });
             });
@@ -37,18 +39,20 @@ module.exports = function register(socket, io) {
                     });
                 }
 
+                logEvent('AUTH', 'Solicitação de registro recebida', { socketID: socket.id, userID, publicKey, signature });
+
                 const nonce = socket.data.nonce;
                 socket.data.nonce = null;
 
-                if (
-                    !nonce ||
-                    !verifySignature(
-                        REGISTER_DOMAIN,
-                        [userID, nonce],
-                        signature,
-                        publicKey
-                    )
-                ) {
+                const signatureValid = Boolean(nonce) && verifySignature(
+                    REGISTER_DOMAIN,
+                    [userID, nonce],
+                    signature,
+                    publicKey
+                );
+                logEvent('AUTH', 'Resultado da verificação da assinatura de registro', { userID, signatureValid, challengePresent: Boolean(nonce) });
+
+                if (!signatureValid) {
                     return reply(callback, {
                         success: false,
                         message: 'Falha na autenticação: assinatura do desafio inválida.',
@@ -83,11 +87,13 @@ module.exports = function register(socket, io) {
 
                     // Atualiza o cache e registra o socket online.
                     publicKeys.set(userID, persistedUser.public_key);
+                    logEvent('AUTH', 'Chave pública persistida/confirmada no PostgreSQL', { userID, publicKey: persistedUser.public_key });
 
                     users.set(socket.id, {
                         userID,
                         publicKey: persistedUser.public_key,
                     });
+                    logEvent('AUTH', 'Usuário autenticado e conectado', { userID, socketID: socket.id });
 
                     reply(callback, { success: true });
 
@@ -97,10 +103,7 @@ module.exports = function register(socket, io) {
 
                     flushQueue(socket, userID);
                 } catch (error) {
-                    console.error(
-                        'Erro ao persistir usuário:',
-                        error.message
-                    );
+                    logError('AUTH', 'Falha ao persistir/registrar usuário', error, { userID });
 
                     return reply(callback, {
                         success: false,

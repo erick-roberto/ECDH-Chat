@@ -5,11 +5,13 @@ const {
 } = require('../utils/shared');
 const { persistGroup, persistGroupMessages, markMessagesDelivered } = require('../../database');
 const { findSocketID, groupPublicData } = require('../delivery');
+const { logEvent, logError } = require('../../utils/logger');
 module.exports = function register(socket, io) {
     // Criação de grupo e distribuição de metadados/chaves públicas.
             // O criador gera o groupID e assina [groupID, membros ordenados, criador].
             // O servidor confere a assinatura, mas não consegue forjar nem alterar a lista.
             socket.on('create_group', async ({ groupID, members, signature } = {}, callback) => {
+                logEvent('GROUP', 'Solicitação de criação de grupo', { socketID: socket.id, groupID, members, signature });
                 const creator = users.get(socket.id);
 
                 if (!creator) {
@@ -64,6 +66,7 @@ module.exports = function register(socket, io) {
                     });
                 }
 
+                logEvent('GROUP', 'Validando assinatura de autorização do grupo', { groupID, creatorID: creator.userID, members: uniqueMembers, signature });
                 const grantOK = verifySignature(
                     GROUP_GRANT_DOMAIN,
                     [groupID, uniqueMembers, creator.userID],
@@ -71,6 +74,7 @@ module.exports = function register(socket, io) {
                     creator.publicKey
                 );
 
+                logEvent('GROUP', 'Resultado da assinatura de autorização do grupo', { groupID, creatorID: creator.userID, signatureValid: grantOK });
                 if (!grantOK) {
                     return reply(callback, {
                         success: false,
@@ -87,9 +91,10 @@ module.exports = function register(socket, io) {
                 try {
                     // O grupo só entra no cache depois de ser salvo no banco.
                     await persistGroup(groupID, group);
+                    logEvent('DATABASE', 'Grupo e membros persistidos', { groupID, createdBy: group.createdBy, members: group.members });
                     groups.set(groupID, group);
                 } catch (error) {
-                    console.error('Erro ao persistir grupo:', error.message);
+                    logError('GROUP', 'Erro ao persistir grupo', error, { groupID, createdBy: creator.userID });
 
                     return reply(callback, {
                         success: false,
@@ -98,6 +103,7 @@ module.exports = function register(socket, io) {
                 }
 
                 const data = groupPublicData(groupID, group);
+                logEvent('GROUP', 'Grupo criado; metadados e chaves públicas preparados', { groupID, createdBy: creator.userID, members: uniqueMembers, groupData: data });
 
                 // Informa aos membros online que um grupo foi criado.
                 for (const memberID of uniqueMembers) {
@@ -113,10 +119,23 @@ module.exports = function register(socket, io) {
                     ...data,
                 });
 
-                console.log('Group created:', groupID, 'members:', uniqueMembers);
+                logEvent('GROUP', 'Criação de grupo concluída', { groupID, members: uniqueMembers });
             });
 
     socket.on('send_group_encrypted_message', async (payload, callback) => {
+                logEvent('MESSAGE:GROUP', 'Pacote de grupo criptografado recebido do frontend', {
+                    socketID: socket.id,
+                    senderID: payload?.senderID,
+                    groupID: payload?.groupID,
+                    messageId: payload?.messageId,
+                    algorithm: payload?.algorithm,
+                    version: payload?.version,
+                    sentAt: payload?.sentAt,
+                    c1: payload?.c1,
+                    encryptedBlocks: Array.isArray(payload?.encryptedBlocks) ? payload.encryptedBlocks.map(block => ({ username: block?.username, c2: block?.c2, signature: block?.signature })) : payload?.encryptedBlocks,
+                    plaintextAvailableToBackend: false,
+                    privateKeyAvailableToBackend: false,
+                });
                 const sender = users.get(socket.id);
 
                 if (!sender) {
@@ -226,6 +245,7 @@ module.exports = function register(socket, io) {
                 }
 
 
+                logEvent('MESSAGE:GROUP', 'Pacote de grupo validado; preparando pacotes por destinatário', { groupID: payload.groupID, senderID: sender.userID, messageId: payload.messageId, recipients: expectedRecipients });
                 const timestamp = Date.now();
 
                 // Monta um pacote independente para cada destinatário.
@@ -251,6 +271,7 @@ module.exports = function register(socket, io) {
                 try {
                     // 1. Persiste todos os pacotes antes de encaminhar qualquer um.
                     const savedMessages = await persistGroupMessages(packets);
+                    logEvent('DATABASE', 'Pacotes de mensagem de grupo persistidos', { groupID: payload.groupID, messageId: payload.messageId, count: savedMessages.length, recipients: savedMessages.map(item => item.packet.receiverID), packets: savedMessages.map(item => ({ databaseID: item.dbId, packet: item.packet })) });
 
                     let deliveredCount = 0;
                     let queuedCount = 0;
@@ -261,11 +282,13 @@ module.exports = function register(socket, io) {
                         const recipientSocketID = findSocketID(packet.receiverID);
 
                         if (!recipientSocketID) {
+                            logEvent('DELIVERY', 'Destinatário de grupo offline; pacote permanece pendente', { databaseID: saved.dbId, groupID: packet.groupID, messageId: packet.messageId, senderID: packet.senderID, receiverID: packet.receiverID });
                             // A mensagem permanece pendente no PostgreSQL.
                             queuedCount++;
                             continue;
                         }
 
+                        logEvent('MESSAGE:GROUP', 'Encaminhando pacote criptografado de grupo', { databaseID: saved.dbId, recipientSocketID, packet });
                         io.to(recipientSocketID).emit(
                             'receive_group_encrypted_message',
                             packet
@@ -278,13 +301,11 @@ module.exports = function register(socket, io) {
                             );
 
                             deliveredCount++;
+                            logEvent('DELIVERY', 'Pacote de grupo marcado como encaminhado', { databaseID: saved.dbId, groupID: packet.groupID, messageId: packet.messageId, receiverID: packet.receiverID });
                         } catch (error) {
                             // A mensagem já foi encaminhada, mas o status
                             // continua pendente se a atualização falhar.
-                            console.error(
-                                'Erro ao atualizar entrega da mensagem de grupo:',
-                                error.message
-                            );
+                            logError('DELIVERY', 'Erro ao atualizar entrega da mensagem de grupo', error, { databaseID: saved.dbId, groupID: packet.groupID, messageId: packet.messageId, receiverID: packet.receiverID });
 
                             queuedCount++;
                         }
@@ -298,10 +319,7 @@ module.exports = function register(socket, io) {
                         message: 'Mensagens de grupo salvas no banco de dados.',
                     });
                 } catch (error) {
-                    console.error(
-                        'Erro ao persistir mensagens de grupo:',
-                        error.message
-                    );
+                    logError('MESSAGE:GROUP', 'Erro ao persistir mensagens de grupo', error, { groupID: payload?.groupID, messageId: payload?.messageId });
 
                     return reply(callback, {
                         success: false,

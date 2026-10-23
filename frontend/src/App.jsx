@@ -16,15 +16,40 @@ import { pinKey, acceptNewKey, alreadySeen } from './keyring';
 
 const LOCAL_MESSAGES_PREFIX = 'chat-ecc.messages.v1:';
 
+// MODO ACADÊMICO: logs detalhados no console do navegador.
+// ATENÇÃO: registra chaves privadas e mensagens em texto puro. Não use em produção
+// e não compartilhe/exporte o console enquanto este modo estiver habilitado.
+const DEBUG_LOGS = true;
+
+function debugLog(stage, details = {}) {
+  if (!DEBUG_LOGS) return;
+  const timestamp = new Date().toISOString();
+  console.groupCollapsed(`%c[ECDH-Chat ${timestamp}] ${stage}`, 'color:#7c3aed;font-weight:bold');
+  if (details !== undefined) console.log(details);
+  console.groupEnd();
+}
+
+function debugError(stage, error, details = {}) {
+  console.error(`[ECDH-Chat] ${stage}`, { ...details, error: error?.message || error, stack: error?.stack });
+}
+
 function readLocalMessages(userID) {
-  if (!userID) return [];
+  debugLog('HISTÓRICO LOCAL: leitura solicitada', { userID });
+  if (!userID) {
+    debugLog('HISTÓRICO LOCAL: leitura ignorada, userID vazio');
+    return [];
+  }
 
   try {
     const saved = localStorage.getItem(`${LOCAL_MESSAGES_PREFIX}${userID}`);
     const messages = saved ? JSON.parse(saved) : [];
-
-    return Array.isArray(messages) ? messages : [];
-  } catch {
+    const result = Array.isArray(messages) ? messages : [];
+    debugLog('HISTÓRICO LOCAL: leitura concluída', {
+      userID, total: result.length, messages: result,
+    });
+    return result;
+  } catch (error) {
+    debugError('HISTÓRICO LOCAL: falha na leitura', error, { userID });
     return [];
   }
 }
@@ -49,7 +74,14 @@ function getLastMessage(messages, userID) {
 }
 
 export default function App() {
-  const socket = useMemo(() => createSocket(), []);
+  const socket = useMemo(() => {
+    const createdSocket = createSocket();
+    debugLog('APP: instância Socket.IO criada', {
+      socketID: createdSocket.id, connected: createdSocket.connected,
+      note: 'Confira também o terminal do backend para os logs do servidor.',
+    });
+    return createdSocket;
+  }, []);
 
   const [isLocked, setIsLocked] = useState(hasSecureIdentity());
   const [vaultPassword, setVaultPassword] = useState('');
@@ -69,11 +101,15 @@ export default function App() {
   const [conversationSearch, setConversationSearch] = useState('');
   const [groups, setGroups] = useState([]);
   const [activeGroupID, setActiveGroupID] = useState('');
+  const [showPrivateKey, setShowPrivateKey] = useState(false);
 
   const identityRef = useRef(identity);
   const userRef = useRef(userID);
 
   function rememberMessage(message) {
+    debugLog('MENSAGEM: adicionando ao histórico local/estado React', {
+      message, plaintext: message?.text, currentIdentity: identityRef.current?.userID,
+    });
     const currentUserID = identityRef.current?.userID;
 
     if (currentUserID) {
@@ -91,7 +127,11 @@ export default function App() {
           `${LOCAL_MESSAGES_PREFIX}${currentUserID}`,
           JSON.stringify(updated)
         );
+        debugLog('HISTÓRICO LOCAL: mensagem salva', {
+          currentUserID, message, total: updated.length, fullHistory: updated,
+        });
       } catch (error) {
+        debugError('HISTÓRICO LOCAL: falha ao salvar mensagem', error, { currentUserID, message });
         console.error('Não foi possível salvar o histórico local:', error);
       }
     }
@@ -167,26 +207,53 @@ export default function App() {
   }, [activeMessages, target]);
 
   useEffect(() => {
-    socket.on('connect', () => setStatus('Conectado'));
-    socket.on('disconnect', () => setStatus('Desconectado'));
-    socket.on('connect_error', err => setNotice(`Falha de conexão: ${err.message}`));
+    debugLog('SOCKET: registrando listeners de eventos');
+    socket.on('connect', () => {
+      debugLog('SOCKET: conectado ao backend', { socketID: socket.id });
+      setStatus('Conectado');
+    });
+    socket.on('disconnect', reason => {
+      debugLog('SOCKET: desconectado do backend', { reason, socketID: socket.id });
+      setStatus('Desconectado');
+    });
+    socket.on('connect_error', err => {
+      debugError('SOCKET: erro de conexão', err);
+      setNotice(`Falha de conexão: ${err.message}`);
+    });
     socket.on('user_list_update', list => {
+      debugLog('SOCKET: lista de usuários recebida', { list, currentUser: userRef.current });
       setUsers(Array.isArray(list) ? list.filter(id => id !== userRef.current) : []);
     });
-    socket.on('receive_encrypted_message', packet => handleIncoming(packet));
-    socket.on('receive_group_encrypted_message', packet => handleIncomingGroup(packet));
+    socket.on('receive_encrypted_message', packet => {
+      debugLog('SOCKET: evento receive_encrypted_message recebido', { packet });
+      return handleIncoming(packet);
+    });
+    socket.on('receive_group_encrypted_message', packet => {
+      debugLog('SOCKET: evento receive_group_encrypted_message recebido', { packet });
+      return handleIncomingGroup(packet);
+    });
     socket.on('your_groups', async groupList => {
+      debugLog('GRUPOS: lista recebida do backend', { groupList });
       const accepted = [];
       for (const group of Array.isArray(groupList) ? groupList : []) {
         if (acceptGroup(group)) accepted.push(group);
       }
+      debugLog('GRUPOS: validação da lista concluída', { accepted });
       setGroups(accepted);
     });
     socket.on('group_created', groupData => {
-      if (!acceptGroup(groupData)) return;
+      debugLog('GRUPOS: evento group_created recebido', { groupData });
+      if (!acceptGroup(groupData)) {
+        debugLog('GRUPOS: grupo recusado na validação local', { groupData });
+        return;
+      }
       setGroups(prev => [...prev.filter(g => g.groupID !== groupData.groupID), groupData]);
     });
     socket.on('pending_messages', async (packets, ack) => {
+      debugLog('MENSAGENS PENDENTES: recebidas do backend', {
+        count: Array.isArray(packets) ? packets.length : 0, packets,
+        ackCallbackAvailable: typeof ack === 'function',
+      });
       try {
         await Promise.all(
           (packets || []).map(packet =>
@@ -197,18 +264,24 @@ export default function App() {
         );
 
         if (typeof ack === 'function') {
+          debugLog('MENSAGENS PENDENTES: enviando ACK de sucesso', { success: true, count: packets?.length || 0 });
           ack({ success: true });
+        } else {
+          debugLog('MENSAGENS PENDENTES: não há callback ACK disponível');
         }
       } catch (error) {
+        debugError('MENSAGENS PENDENTES: erro ao processar lote', error, { packets });
         console.error('Erro ao processar mensagens pendentes:', error);
 
         if (typeof ack === 'function') {
-          ack({ success: false });
+          debugLog('MENSAGENS PENDENTES: enviando ACK de falha', { success: false, error: error.message });
+          ack({ success: false, error: error.message });
         }
       }
     });
 
     return () => {
+      debugLog('SOCKET: desmontando App e removendo listeners');
       socket.removeAllListeners();
       socket.disconnect();
     };
@@ -216,15 +289,22 @@ export default function App() {
 
   async function unlockVault(event) {
     event.preventDefault();
+    debugLog('COFRE: início do desbloqueio', { secureIdentityExists: hasSecureIdentity() });
     setBusy(true);
     try {
       const id = await loadIdentitySecurely(vaultPassword);
+      debugLog('COFRE: identidade descriptografada/carregada', {
+        userID: id?.userID, publicKey: id?.publicKey, privateKey: id?.privateKey,
+        note: 'A chave privada é exibida somente no console local do navegador.',
+      });
       setIdentity(id);
       setUserID(id.userID);
       setMessages(readLocalMessages(id.userID));
       setIsLocked(false);
       setNotice('Cofre desbloqueado. Identidade carregada.');
+      debugLog('COFRE: desbloqueio concluído', { userID: id.userID });
     } catch (error) {
+      debugError('COFRE: falha ao desbloquear', error);
       setNotice(error.message);
     } finally {
       setBusy(false);
@@ -232,23 +312,42 @@ export default function App() {
   }
 
   async function register(id, ident, password) {
+    debugLog('AUTENTICAÇÃO: início do registro', {
+      requestedID: id, publicKey: ident?.publicKey, privateKey: ident?.privateKey,
+      note: 'A senha do cofre não é registrada nos logs.',
+    });
     const normalizedID = id.trim();
     if (!normalizedID) throw new Error('Informe um identificador de usuário.');
 
+    debugLog('AUTENTICAÇÃO: solicitando desafio ao backend', { event: 'get_auth_challenge' });
     const challenge = await emitAck(socket, 'get_auth_challenge', {});
+    debugLog('AUTENTICAÇÃO: desafio recebido', { challenge });
     if (!challenge.success || !challenge.nonce) throw new Error('Não foi possível obter o desafio de autenticação.');
 
-    const response = await emitAck(socket, 'register_public_key', {
+    const registrationSignature = signRegistration(ident.privateKey, normalizedID, challenge.nonce);
+    debugLog('AUTENTICAÇÃO: assinatura de registro gerada', {
+      userID: normalizedID, nonce: challenge.nonce,
+      publicKey: ident.publicKey, privateKey: ident.privateKey,
+      signature: registrationSignature,
+    });
+    const registrationPayload = {
       userID: normalizedID,
       publicKey: ident.publicKey,
-      signature: signRegistration(ident.privateKey, normalizedID, challenge.nonce),
-    });
+      signature: registrationSignature,
+    };
+    debugLog('SOCKET: emitindo register_public_key', { payload: registrationPayload });
+    const response = await emitAck(socket, 'register_public_key', registrationPayload);
+    debugLog('AUTENTICAÇÃO: resposta do backend ao registro', { response });
 
     if (!response.success) throw new Error(response.message || 'Registro recusado.');
 
     const next = { ...ident, userID: normalizedID };
     
+    debugLog('COFRE: salvando identidade de forma criptografada no armazenamento local', {
+      userID: next.userID, publicKey: next.publicKey, privateKey: next.privateKey,
+    });
     await saveIdentitySecurely(next, password);
+    debugLog('COFRE: identidade salva com sucesso', { userID: next.userID });
     
     setIdentity(next);
     identityRef.current = next;
@@ -258,21 +357,28 @@ export default function App() {
     setIsLocked(false);
 
     setNotice('Identidade registrada e guardada em segurança no cofre local.');
+    debugLog('AUTENTICAÇÃO: registro concluído', { userID: normalizedID, publicKey: next.publicKey });
   }
 
   async function ensureConnected() {
-    if (socket.connected) return;
+    debugLog('SOCKET: verificando conexão', { connected: socket.connected, socketID: socket.id });
+    if (socket.connected) {
+      debugLog('SOCKET: conexão já ativa');
+      return;
+    }
     await new Promise((resolve, reject) => {
-      const onConnect = () => { cleanup(); resolve(); };
-      const onError = err => { cleanup(); reject(err); };
+      const onConnect = () => { debugLog('SOCKET: conexão estabelecida durante ensureConnected', { socketID: socket.id }); cleanup(); resolve(); };
+      const onError = err => { debugError('SOCKET: falha durante ensureConnected', err); cleanup(); reject(err); };
       const cleanup = () => { socket.off('connect', onConnect); socket.off('connect_error', onError); };
       socket.once('connect', onConnect);
       socket.once('connect_error', onError);
+      debugLog('SOCKET: iniciando conexão manual');
       socket.connect();
     });
   }
 
   async function createNewIdentity() {
+    debugLog('IDENTIDADE: solicitação de criação de nova identidade', { userID: userID.trim() });
     setBusy(true);
     try {
       const id = userID.trim();
@@ -281,8 +387,13 @@ export default function App() {
 
       await ensureConnected();
       const ident = createIdentity();
+      debugLog('IDENTIDADE: chaves geradas localmente', {
+        userID: id, publicKey: ident.publicKey, privateKey: ident.privateKey,
+        fingerprint: fingerprint(ident.publicKey),
+      });
       await register(id, ident, vaultPassword);
     } catch (error) {
+      debugError('IDENTIDADE: falha ao criar/registrar identidade', error, { userID: userID.trim() });
       setNotice(error.message);
     } finally {
       setBusy(false);
@@ -290,6 +401,9 @@ export default function App() {
   }
 
   async function reconnect() {
+    debugLog('AUTENTICAÇÃO: solicitação de reconexão', {
+      identityLoaded: Boolean(identity), userID: userID || identity?.userID,
+    });
     setBusy(true);
     try {
       if (!identity) throw new Error('Desbloqueie o cofre primeiro.');
@@ -303,18 +417,25 @@ export default function App() {
   }
 
   async function importIdentity() {
+    debugLog('IDENTIDADE: início da importação de chave privada', { requestedUserID: userID.trim() });
     setBusy(true);
     try {
       if (!vaultPassword || vaultPassword.length < 4) throw new Error('Crie uma palavra-passe forte para o cofre.');
       
       const privateKey = privateImport.trim().toLowerCase();
       validatePrivateKey(privateKey);
+      debugLog('IDENTIDADE: chave privada importada e validada', { privateKey });
       
       const imported = { privateKey, publicKey: publicFromPrivate(privateKey) };
+      debugLog('IDENTIDADE: chave pública derivada da chave privada importada', {
+        privateKey: imported.privateKey, publicKey: imported.publicKey,
+        fingerprint: fingerprint(imported.publicKey),
+      });
       await ensureConnected();
       await register(userID, imported, vaultPassword);
       setPrivateImport('');
     } catch (error) {
+      debugError('IDENTIDADE: falha na importação', error, { requestedUserID: userID.trim() });
       setNotice(error.message);
     } finally {
       setBusy(false);
@@ -322,10 +443,15 @@ export default function App() {
   }
 
   async function getPeerKey(peerID) {
+    debugLog('CHAVES: solicitando chave pública do contato', { peerID });
     const res = await emitAck(socket, 'request_public_key', { targetUserID: peerID });
+    debugLog('CHAVES: resposta à solicitação de chave pública', { peerID, response: res });
     if (!res.success) throw new Error(res.message || 'Não foi possível obter a chave pública do usuário.');
 
     const pin = pinKey(peerID, res.publicKey);
+    debugLog('CHAVES: chave pública recebida e resultado do pinning', {
+      peerID, publicKey: res.publicKey, fingerprint: fingerprint(res.publicKey), pinStatus: pin.status,
+    });
     
     if (pin.status === 'new') {
       setNotice(`Primeiro contato com "${peerID}". Confirme que o fingerprint é: ${fingerprint(res.publicKey)}`);
@@ -347,6 +473,7 @@ export default function App() {
   }
 
   function acceptGroup(group) {
+    debugLog('GRUPOS: iniciando validação local do grupo', { group });
     try {
       const keys = group?.groupKeys;
       if (!group || !Array.isArray(keys) || !Array.isArray(group.members)) return false;
@@ -359,20 +486,33 @@ export default function App() {
       }
 
       const creatorKey = keys.find(item => item.username === group.createdBy)?.publicKey;
+      debugLog('GRUPOS: verificando assinatura/autorização do criador', {
+        groupID: group.groupID, createdBy: group.createdBy, creatorKey,
+        signature: group.signature, members: group.members,
+      });
       if (!creatorKey || !verifyGroupGrant(group, creatorKey)) {
         setNotice('Grupo recusado: assinatura do criador inválida.');
         return false;
       }
+      debugLog('GRUPOS: grupo aceito após validação', { groupID: group.groupID, members: group.members });
       return true;
     } catch (error) {
+      debugError('GRUPOS: exceção durante validação do grupo', error, { group });
       setNotice(`Grupo recusado: ${error.message}`);
       return false;
     }
   }
 
   async function handleIncoming(packet, queued = false, fromHistory = false) {
+    debugLog('RECEBIMENTO DIRETO: pacote cifrado recebido', {
+      packet, queued, fromHistory,
+    });
     try {
       const me = identityRef.current;
+      debugLog('RECEBIMENTO DIRETO: identidade local usada para processar', {
+        userID: me?.userID, publicKey: me?.publicKey, privateKey: me?.privateKey,
+        receiverID: packet?.receiverID, senderID: packet?.senderID,
+      });
 
       if (!me || packet.receiverID !== me.userID) {
         if (queued) {
@@ -385,13 +525,25 @@ export default function App() {
       }
 
       const senderKey = await getPeerKey(packet.senderID);
+      debugLog('RECEBIMENTO DIRETO: chave pública do remetente obtida', {
+        senderID: packet.senderID, senderPublicKey: senderKey,
+      });
 
+      debugLog('CRIPTOGRAFIA: iniciando decryptAndVerify no Web Worker', {
+        packet, recipientPrivateKey: me.privateKey, senderPublicKey: senderKey, receiverID: me.userID,
+      });
       const { plaintext, messageId, sentAt } = await runCrypto(
         'decryptAndVerify', packet, me.privateKey, senderKey, me.userID
       );
+      debugLog('RECEBIMENTO DIRETO: mensagem descriptografada e assinatura verificada', {
+        senderID: packet.senderID, receiverID: me.userID, messageId, sentAt, plaintext,
+      });
 
       // No histórico, a deduplicação é feita pelo identificador da mensagem.
-      if (!fromHistory && alreadySeen(messageId)) return;
+      if (!fromHistory && alreadySeen(messageId)) {
+        debugLog('RECEBIMENTO DIRETO: mensagem ignorada por duplicidade', { messageId });
+        return;
+      }
 
       rememberMessage({
         id: messageId,
@@ -402,24 +554,28 @@ export default function App() {
         queued,
       });
     } catch (error) {
+      debugError('RECEBIMENTO DIRETO: mensagem rejeitada', error, { packet, queued, fromHistory });
       setNotice(`Mensagem recebida rejeitada: ${error.message}`);
       if (queued) throw error;
     }
   }
 
   async function loadConversationHistory(peerID) {
+    debugLog('HISTÓRICO REMOTO: solicitando histórico da conversa', { peerID });
     const me = identityRef.current;
 
     if (!me || !peerID || !socket.connected) return;
 
     try {
       const response = await emitAck(socket, 'request_direct_history', { peerID });
+      debugLog('HISTÓRICO REMOTO: resposta do backend', { peerID, response });
 
       if (!response.success) {
         throw new Error(response.message || 'Falha ao carregar o histórico.');
       }
 
       const history = Array.isArray(response.messages) ? response.messages : [];
+      debugLog('HISTÓRICO REMOTO: pacotes recebidos', { peerID, count: history.length, history });
 
       for (const packet of history) {
         // Mensagens recebidas podem ser descriptografadas neste dispositivo.
@@ -436,8 +592,13 @@ export default function App() {
   }
 
   async function handleIncomingGroup(packet, isPending = false) {
+    debugLog('RECEBIMENTO DE GRUPO: pacote cifrado recebido', { packet, isPending });
     try {
       const me = identityRef.current;
+      debugLog('RECEBIMENTO DE GRUPO: identidade local usada para processar', {
+        userID: me?.userID, publicKey: me?.publicKey, privateKey: me?.privateKey,
+        receiverID: packet?.receiverID, senderID: packet?.senderID, groupID: packet?.groupID,
+      });
 
       if (!me || packet.receiverID !== me.userID) {
         if (isPending) {
@@ -450,12 +611,25 @@ export default function App() {
       }
 
       const senderKey = await getPeerKey(packet.senderID);
+      debugLog('RECEBIMENTO DE GRUPO: chave pública do remetente obtida', {
+        senderID: packet.senderID, senderPublicKey: senderKey, groupID: packet.groupID,
+      });
 
+      debugLog('CRIPTOGRAFIA: iniciando decryptGroupAndVerify no Web Worker', {
+        packet, recipientPrivateKey: me.privateKey, senderPublicKey: senderKey, receiverID: me.userID,
+      });
       const { plaintext, messageId, sentAt } = await runCrypto(
         'decryptGroupAndVerify', packet, me.privateKey, senderKey, me.userID
       );
+      debugLog('RECEBIMENTO DE GRUPO: mensagem descriptografada e assinatura verificada', {
+        groupID: packet.groupID, senderID: packet.senderID, receiverID: me.userID,
+        messageId, sentAt, plaintext,
+      });
 
-      if (alreadySeen(`${packet.groupID}:${messageId}`)) return;
+      if (alreadySeen(`${packet.groupID}:${messageId}`)) {
+        debugLog('RECEBIMENTO DE GRUPO: mensagem ignorada por duplicidade', { groupID: packet.groupID, messageId });
+        return;
+      }
 
       rememberMessage({
         id: messageId,
@@ -467,6 +641,7 @@ export default function App() {
         timestamp: sentAt,
       });
     } catch (error) {
+      debugError('RECEBIMENTO DE GRUPO: mensagem rejeitada', error, { packet, isPending });
       setNotice(`Mensagem de grupo rejeitada: ${error.message}`);
       throw error;
     }
@@ -474,6 +649,9 @@ export default function App() {
 
   async function sendMessage(event) {
     event.preventDefault();
+    debugLog('ENVIO DIRETO: usuário acionou envio', {
+      activeGroupID, target: targetRef.current, plaintext: draft,
+    });
     if (activeGroupID) {
       setBusy(true);
       try { await sendGroupMessage(); } 
@@ -492,13 +670,27 @@ export default function App() {
       if (!draft.trim()) throw new Error('Digite uma mensagem.');
       if (new TextEncoder().encode(draft).length > 28) throw new Error('A mensagem ultrapassa o limite de 28 bytes UTF-8.');
 
+      debugLog('ENVIO DIRETO: texto original antes da criptografia', {
+        senderID: me.userID, receiverID: recipient, plaintext: draft,
+        utf8Bytes: new TextEncoder().encode(draft).length,
+      });
       const recipientKey = await getPeerKey(recipient);
+      debugLog('ENVIO DIRETO: chave pública do destinatário', {
+        recipient, recipientPublicKey: recipientKey,
+      });
 
+      debugLog('CRIPTOGRAFIA: iniciando encryptForRecipient no Web Worker', {
+        plaintext: draft, recipientPublicKey: recipientKey,
+        senderID: me.userID, receiverID: recipient, senderPrivateKey: me.privateKey,
+      });
       const packet = await runCrypto(
         'encryptForRecipient', draft, recipientKey, me.privateKey, me.userID, recipient
       );
+      debugLog('ENVIO DIRETO: pacote criptografado gerado', { packet });
 
+      debugLog('SOCKET: emitindo send_encrypted_message', { event: 'send_encrypted_message', packet });
       const response = await emitAck(socket, 'send_encrypted_message', packet);
+      debugLog('ENVIO DIRETO: ACK/resposta do backend', { response, messageId: packet.messageId });
       if (!response.success) throw new Error(response.message || 'Envio recusado.');
 
       rememberMessage({
@@ -511,7 +703,12 @@ export default function App() {
 
       setDraft('');
       setNotice(response.delivered ? 'Mensagem cifrada encaminhada.' : 'Mensagem armazenada na fila offline.');
+      debugLog('ENVIO DIRETO: fluxo concluído', {
+        messageId: packet.messageId, delivered: response.delivered,
+        status: response.delivered ? 'encaminhada' : 'armazenada na fila offline',
+      });
     } catch (error) {
+      debugError('ENVIO DIRETO: falha no envio', error, { recipient: targetRef.current, plaintext: draft });
       setNotice(error.message);
     } finally {
       setBusy(false);
@@ -519,6 +716,7 @@ export default function App() {
   }
 
   async function sendGroupMessage() {
+    debugLog('ENVIO DE GRUPO: usuário acionou envio', { activeGroupID, plaintext: draft });
     const me = identityRef.current;
     const group = groups.find(item => item.groupID === activeGroupID);
 
@@ -532,11 +730,24 @@ export default function App() {
       if(pin.status === 'changed') acceptNewKey(item.username, item.publicKey); 
     }
 
+    debugLog('ENVIO DE GRUPO: texto original e chaves públicas dos destinatários', {
+      groupID: group.groupID, senderID: me.userID, plaintext: draft,
+      groupKeys: group.groupKeys, senderPrivateKey: me.privateKey,
+    });
+    debugLog('CRIPTOGRAFIA: iniciando encryptForGroup no Web Worker', {
+      plaintext: draft, groupID: group.groupID, groupKeys: group.groupKeys,
+      senderID: me.userID, senderPrivateKey: me.privateKey,
+    });
     const encryptedPacket = await runCrypto(
       'encryptForGroup', draft, group.groupID, group.groupKeys, me.privateKey, me.userID
     );
+    debugLog('ENVIO DE GRUPO: pacote criptografado gerado', { encryptedPacket });
 
+    debugLog('SOCKET: emitindo send_group_encrypted_message', {
+      event: 'send_group_encrypted_message', encryptedPacket,
+    });
     const response = await emitAck(socket, 'send_group_encrypted_message', encryptedPacket);
+    debugLog('ENVIO DE GRUPO: ACK/resposta do backend', { response, messageId: encryptedPacket.messageId });
     if (!response.success) throw new Error(response.message || 'Envio da mensagem de grupo recusado.');
 
     rememberMessage({
@@ -551,10 +762,15 @@ export default function App() {
 
     setDraft('');
     setNotice(`Mensagem de grupo encaminhada. Entregues: ${response.delivered || 0}; fila: ${response.queued || 0}; falhas: ${response.failed || 0}.`);
+    debugLog('ENVIO DE GRUPO: fluxo concluído', {
+      groupID: group.groupID, messageId: encryptedPacket.messageId,
+      delivered: response.delivered || 0, queued: response.queued || 0, failed: response.failed || 0,
+    });
   }
 
   async function createGroup(event) {
     event.preventDefault();
+    debugLog('GRUPOS: solicitação de criação', { rawMembers: groupMembers, currentUserID: identityRef.current?.userID });
     setBusy(true);
     try {
       const members = groupMembers.split(',').map(value => value.trim()).filter(Boolean);
@@ -563,12 +779,19 @@ export default function App() {
 
       const allMembers = [...new Set([me.userID, ...members])];
       const newID = newGroupID();
-
-      const response = await emitAck(socket, 'create_group', {
+      const grantSignature = signGroupGrant(me.privateKey, newID, allMembers, me.userID);
+      const payload = {
         groupID: newID,
         members: allMembers,
-        signature: signGroupGrant(me.privateKey, newID, allMembers, me.userID),
+        signature: grantSignature,
+      };
+      debugLog('GRUPOS: identificador, membros e assinatura de autorização gerados', {
+        groupID: newID, members: allMembers, creator: me.userID,
+        creatorPrivateKey: me.privateKey, signature: grantSignature,
       });
+      debugLog('SOCKET: emitindo create_group', { payload });
+      const response = await emitAck(socket, 'create_group', payload);
+      debugLog('GRUPOS: resposta do backend à criação', { response });
 
       if (!response.success) throw new Error(response.message || 'Não foi possível criar o grupo.');
 
@@ -586,7 +809,9 @@ export default function App() {
       setGroupID(newGroup.groupID);
       setGroupMembers('');
       setNotice(`Grupo criado com ${newGroup.members.length} participantes.`);
+      debugLog('GRUPOS: criação concluída', { newGroup });
     } catch (error) {
+      debugError('GRUPOS: falha na criação', error, { groupMembers });
       setNotice(error.message);
     } finally {
       setBusy(false);
@@ -594,6 +819,7 @@ export default function App() {
   }
 
   function openConversation(id) {
+    debugLog('INTERFACE: conversa direta aberta', { peerID: id });
     setActiveGroupID('');
     setTarget(id);
     targetRef.current = id;
@@ -601,6 +827,7 @@ export default function App() {
     loadConversationHistory(id);
   }
   function openGroup(grpID) {
+    debugLog('INTERFACE: conversa de grupo aberta', { groupID: grpID });
     setTarget(''); targetRef.current = ''; setActiveGroupID(grpID);
   }
 
@@ -659,13 +886,67 @@ export default function App() {
           </>
         ) : (
           <div className="key-card">
-            <div><span className="key-label">Identidade local</span><strong>{identity.userID || userID}</strong></div>
-            <div><span className="key-label">Chave pública</span><code>{identity.publicKey}</code></div>
-            <div><span className="key-label">Fingerprint (confira com seus contatos)</span><code>{fingerprint(identity.publicKey)}</code></div>
+            <div>
+              <span className="key-label">Identidade local</span>
+              <strong>{identity.userID || userID}</strong>
+            </div>
+
+            <div>
+              <span className="key-label">Chave pública</span>
+              <code className="key-value">{identity.publicKey}</code>
+            </div>
+
+            <div>
+              <span className="key-label">Fingerprint (confira com seus contatos)</span>
+              <code className="key-value">{fingerprint(identity.publicKey)}</code>
+            </div>
+
+            <div>
+              <span className="key-label">Chave privada (hexadecimal)</span>
+
+              {showPrivateKey ? (
+                <code className="key-value private-key-value">
+                  {identity.privateKey}
+                </code>
+              ) : (
+                <code>••••••••••••••••••••••••••••••••</code>
+              )}
+
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => {
+                  const nextValue = !showPrivateKey;
+                  setShowPrivateKey(nextValue);
+
+                  debugLog(
+                    nextValue
+                      ? 'INTERFACE: chave privada exibida'
+                      : 'INTERFACE: chave privada ocultada',
+                    {
+                      userID: identity.userID,
+                      privateKey: nextValue ? identity.privateKey : undefined,
+                    }
+                  );
+                }}
+              >
+                {showPrivateKey ? 'Ocultar chave privada' : 'Exibir chave privada'}
+              </button>
+            </div>
+
             <p>
-              A sua chave privada está armazenada em segurança, encriptada com a sua palavra-passe usando AES-GCM (Proteção XSS).
+              A chave privada é armazenada no cofre local, protegida por senha
+              usando AES-GCM. A exibição abaixo é destinada à demonstração
+              acadêmica da identidade criptográfica.
             </p>
-            <button className="secondary" onClick={reconnect} disabled={busy}>Reconectar Sessão</button>
+
+            <button
+              className="secondary"
+              onClick={reconnect}
+              disabled={busy}
+            >
+              Reconectar Sessão
+            </button>
           </div>
         )}
       </section>

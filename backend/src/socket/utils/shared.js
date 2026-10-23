@@ -1,6 +1,7 @@
 const { secp256k1 } = require('@noble/curves/secp256k1');
 const { sha256 } = require('@noble/hashes/sha256');
 const { users, publicKeys, groups } = require('../../state/runtimeState');
+const { logEvent } = require('../../utils/logger');
 
 const MAX_GROUP_SIZE = 100;
 const PROTOCOL_VERSION = 2;
@@ -50,7 +51,11 @@ function allowed(socket) {
     const hits = (socket.data.hits || []).filter(t => now - t < RATE_WINDOW_MS);
     hits.push(now);
     socket.data.hits = hits;
-    return hits.length <= RATE_MAX_EVENTS;
+    const permitted = hits.length <= RATE_MAX_EVENTS;
+    if (!permitted) {
+        logEvent('SECURITY', 'Limite de requisições excedido', { socketID: socket.id, countInWindow: hits.length, windowMs: RATE_WINDOW_MS });
+    }
+    return permitted;
 }
 
 const sortedMembers = members => [...new Set(members)].sort();

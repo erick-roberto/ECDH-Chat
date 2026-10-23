@@ -6,8 +6,23 @@ const {
     persistDirectMessage, markMessagesDelivered, getDirectHistory,
 } = require('../../database');
 const { findSocketID } = require('../delivery');
+const { logEvent, logError } = require('../../utils/logger');
 module.exports = function register(socket, io) {
     socket.on('send_encrypted_message', async (payload, callback) => {
+                logEvent('MESSAGE:DIRECT', 'Pacote criptografado recebido do frontend', {
+                    socketID: socket.id,
+                    senderID: payload?.senderID,
+                    receiverID: payload?.receiverID,
+                    messageId: payload?.messageId,
+                    algorithm: payload?.algorithm,
+                    version: payload?.version,
+                    sentAt: payload?.sentAt,
+                    c1: payload?.c1,
+                    c2: payload?.c2,
+                    signature: payload?.signature,
+                    plaintextAvailableToBackend: false,
+                    privateKeyAvailableToBackend: false,
+                });
                 const sender = users.get(socket.id);
 
                 if (!sender) {
@@ -37,6 +52,7 @@ module.exports = function register(socket, io) {
                     isSignatureHex(payload.signature);
 
                 if (!valid) {
+                    logEvent('MESSAGE:DIRECT', 'Pacote rejeitado na validação estrutural', { senderID: sender.userID, receiverID: payload?.receiverID });
                     return reply(callback, {
                         success: false,
                         message: 'Pacote inválido (versão, algoritmo, remetente ou campos).',
@@ -44,6 +60,7 @@ module.exports = function register(socket, io) {
                 }
 
                 if (!publicKeys.has(payload.receiverID)) {
+                    logEvent('MESSAGE:DIRECT', 'Pacote rejeitado: destinatário desconhecido', { senderID: sender.userID, receiverID: payload.receiverID });
                     return reply(callback, {
                         success: false,
                         message: 'Destinatário desconhecido.',
@@ -64,13 +81,17 @@ module.exports = function register(socket, io) {
                     timestamp: Date.now(),
                 };
 
+                logEvent('MESSAGE:DIRECT', 'Pacote validado; iniciando persistência', { packet });
+
                 try {
                     // Persiste antes de tentar encaminhar.
                     const databaseID = await persistDirectMessage(packet);
+                    logEvent('DATABASE', 'Mensagem direta persistida', { databaseID, messageId: packet.messageId, senderID: packet.senderID, receiverID: packet.receiverID, deliveryStatus: 'pending' });
 
                     const recipientSocketID = findSocketID(payload.receiverID);
 
                     if (recipientSocketID) {
+                        logEvent('MESSAGE:DIRECT', 'Encaminhando pacote criptografado ao destinatário online', { messageId: packet.messageId, senderID: packet.senderID, receiverID: packet.receiverID, recipientSocketID, packet });
                         io.to(recipientSocketID).emit(
                             'receive_encrypted_message',
                             packet
@@ -81,6 +102,7 @@ module.exports = function register(socket, io) {
                             [databaseID],
                             payload.receiverID
                         );
+                        logEvent('DELIVERY', 'Mensagem marcada como encaminhada pelo servidor', { databaseID, messageId: packet.messageId, receiverID: payload.receiverID });
 
                         return reply(callback, {
                             success: true,
@@ -89,6 +111,7 @@ module.exports = function register(socket, io) {
                         });
                     }
 
+                    logEvent('DELIVERY', 'Destinatário offline; mensagem mantida como pendente', { databaseID, messageId: packet.messageId, receiverID: payload.receiverID });
                     // A mensagem já está salva com status "pending".
                     // Não precisamos mais colocá-la na fila em memória.
                     return reply(callback, {
@@ -98,10 +121,7 @@ module.exports = function register(socket, io) {
                         message: 'Mensagem salva; será entregue quando o destinatário se conectar.',
                     });
                 } catch (error) {
-                    console.error(
-                        'Erro ao persistir ou encaminhar mensagem:',
-                        error.message
-                    );
+                    logError('MESSAGE:DIRECT', 'Erro ao persistir ou encaminhar mensagem', error, { messageId: payload?.messageId, senderID: payload?.senderID, receiverID: payload?.receiverID });
 
                     return reply(callback, {
                         success: false,
@@ -111,6 +131,7 @@ module.exports = function register(socket, io) {
             });
 
     socket.on('request_direct_history', async ({ peerID } = {}, callback) => {
+                logEvent('HISTORY', 'Solicitação de histórico direto', { socketID: socket.id, peerID });
                 const currentUser = users.get(socket.id);
 
                 if (!currentUser) {
@@ -142,6 +163,7 @@ module.exports = function register(socket, io) {
                         currentUser.userID,
                         peerID
                     );
+                    logEvent('HISTORY', 'Histórico direto carregado', { userID: currentUser.userID, peerID, count: history.length, messages: history });
 
                     return reply(callback, {
                         success: true,
@@ -149,10 +171,7 @@ module.exports = function register(socket, io) {
                         messages: history,
                     });
                 } catch (error) {
-                    console.error(
-                        'Erro ao recuperar histórico de mensagens:',
-                        error.message
-                    );
+                    logError('HISTORY', 'Erro ao recuperar histórico de mensagens', error, { userID: currentUser.userID, peerID });
 
                     return reply(callback, {
                         success: false,

@@ -4,8 +4,10 @@ const {
     compactHexToUuid,
     uuidToCompactHex,
 } = require('../utils/identifiers');
+const { logEvent, logError } = require('../utils/logger');
 
 async function persistDirectMessage(packet) {
+    logEvent('DATABASE', 'Inserindo mensagem direta criptografada', { messageId: packet.messageId, senderID: packet.senderID, receiverID: packet.receiverID, algorithm: packet.algorithm, version: packet.version, c1: packet.c1, c2: packet.c2, signature: packet.signature, status: 'pending' });
     const result = await pool.query(
         `
         INSERT INTO messages (
@@ -54,6 +56,7 @@ async function persistDirectMessage(packet) {
         ]
     );
 
+    logEvent('DATABASE', 'Mensagem direta inserida', { databaseID: result.rows[0].id, messageId: packet.messageId });
     return result.rows[0].id;
 }
 
@@ -62,6 +65,7 @@ async function persistGroupMessages(packets) {
         return [];
     }
 
+    logEvent('DATABASE', 'Iniciando transação para persistir mensagens de grupo', { count: packets.length, groupID: packets[0]?.groupID, messageId: packets[0]?.messageId });
     const client = await pool.connect();
 
     try {
@@ -123,10 +127,12 @@ async function persistGroupMessages(packets) {
         }
 
         await client.query('COMMIT');
+        logEvent('DATABASE', 'Transação de mensagens de grupo confirmada', { count: savedMessages.length, databaseIDs: savedMessages.map(item => item.dbId) });
 
         return savedMessages;
     } catch (error) {
         await client.query('ROLLBACK');
+        logError('DATABASE', 'Transação de mensagens de grupo revertida', error);
         throw error;
     } finally {
         client.release();
@@ -135,6 +141,7 @@ async function persistGroupMessages(packets) {
 
 
 async function getPendingMessages(userID) {
+    logEvent('DATABASE', 'Consultando mensagens pendentes', { userID });
     const result = await pool.query(
         `
         SELECT
@@ -154,7 +161,7 @@ async function getPendingMessages(userID) {
         [userID]
     );
 
-    return result.rows.map(row => {
+    const messages = result.rows.map(row => {
         const payload = row.encrypted_payload ?? {};
 
         const packet = {
@@ -176,6 +183,8 @@ async function getPendingMessages(userID) {
             packet,
         };
     });
+    logEvent('DATABASE', 'Mensagens pendentes recuperadas', { userID, count: messages.length, messages });
+    return messages;
 }
 
 
@@ -184,7 +193,8 @@ async function markMessagesDelivered(messageIDs, receiverID) {
         return;
     }
 
-    await pool.query(
+    logEvent('DATABASE', 'Atualizando status das mensagens para delivered', { messageIDs, receiverID });
+    const result = await pool.query(
         `
         UPDATE messages
         SET delivery_status = 'delivered',
@@ -195,10 +205,12 @@ async function markMessagesDelivered(messageIDs, receiverID) {
         `,
         [messageIDs, receiverID]
     );
+    logEvent('DATABASE', 'Atualização de entrega concluída', { receiverID, requestedCount: messageIDs.length, updatedCount: result.rowCount });
 }
 
 
 async function getDirectHistory(userID, peerID) {
+    logEvent('DATABASE', 'Consultando histórico direto', { userID, peerID });
     const result = await pool.query(
         `
         SELECT
@@ -225,7 +237,7 @@ async function getDirectHistory(userID, peerID) {
         [userID, peerID]
     );
 
-    return result.rows.map(row => ({
+    const messages = result.rows.map(row => ({
         type: 'direct',
         version: row.version,
         algorithm: row.algorithm,
@@ -239,6 +251,8 @@ async function getDirectHistory(userID, peerID) {
         timestamp: row.encrypted_payload.timestamp
             ?? new Date(row.created_at).getTime(),
     }));
+    logEvent('DATABASE', 'Histórico direto recuperado', { userID, peerID, count: messages.length, messages });
+    return messages;
 }
 
 module.exports = {

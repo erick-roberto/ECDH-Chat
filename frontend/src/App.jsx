@@ -490,7 +490,6 @@ export default function App() {
       if (!me) throw new Error('Desbloqueie ou registe uma identidade primeiro.');
       if (!recipient || recipient === me.userID) throw new Error('Escolha outro usuário.');
       if (!draft.trim()) throw new Error('Digite uma mensagem.');
-      if (new TextEncoder().encode(draft).length > 28) throw new Error('A mensagem ultrapassa o limite de 28 bytes UTF-8.');
 
       const recipientKey = await getPeerKey(recipient);
 
@@ -525,7 +524,6 @@ export default function App() {
     if (!me) throw new Error('Registre uma identidade primeiro.');
     if (!group) throw new Error('Grupo não encontrado nesta sessão.');
     if (!draft.trim()) throw new Error('Digite uma mensagem.');
-    if (new TextEncoder().encode(draft).length > 28) throw new Error('A mensagem ultrapassa o limite de 28 bytes UTF-8.');
 
     for (const item of group.groupKeys) {
       const pin = pinKey(item.username, item.publicKey);
@@ -812,14 +810,12 @@ export default function App() {
             <textarea
               value={draft}
               onChange={e => setDraft(e.target.value)}
-              placeholder="Digite uma mensagem (Max. 28 bytes)"
+              placeholder="Digite uma mensagem "
               rows={3}
-              maxLength={28}
               disabled={(!target && !activeGroupID) || busy || isLocked}
             />
             <div className="composer-footer">
-              <span>{new TextEncoder().encode(draft).length}/28 bytes</span>
-              <button disabled={busy || (!target && !activeGroupID) || !draft.trim() || new TextEncoder().encode(draft).length > 28 || isLocked}>
+              <button disabled={busy || (!target && !activeGroupID) || !draft.trim() || isLocked}>
                 Cifrar e enviar ↗
               </button>
             </div>

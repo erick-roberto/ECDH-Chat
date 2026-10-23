@@ -3,9 +3,9 @@ const { sha256 } = require('@noble/hashes/sha256');
 const { users, publicKeys, groups } = require('../../state/runtimeState');
 
 const MAX_GROUP_SIZE = 100;
-const PROTOCOL_VERSION = 2;
-const DIRECT_ALGORITHM = 'EC-ElGamal-secp256k1-direct-v2';
-const GROUP_ALGORITHM = 'EC-ElGamal-secp256k1-group-v2';
+const PROTOCOL_VERSION = 3;
+const DIRECT_ALGORITHM = 'Hybrid-ECDHE-AES256GCM-direct-v3';
+const GROUP_ALGORITHM = 'Hybrid-ECDHE-AES256GCM-group-v3';
 const REGISTER_DOMAIN = 'chat-ecc/register/v1';
 const GROUP_GRANT_DOMAIN = 'chat-ecc/group-grant/v1';
 const RATE_WINDOW_MS = 10_000;

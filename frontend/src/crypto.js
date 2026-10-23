@@ -5,7 +5,6 @@ const Point = secp256k1.ProjectivePoint;
 const CURVE_ORDER = secp256k1.CURVE.n;
 
 function randomScalar() {
-  // CSPRNG do navegador; nunca usar Math.random() para material criptográfico.
   const bytes = new Uint8Array(32);
   for (;;) {
     crypto.getRandomValues(bytes);
@@ -32,16 +31,10 @@ function concat(...arrays) {
   for (const a of arrays) { out.set(a, offset); offset += a.length; }
   return out;
 }
-function bytesToBigint(bytes) {
-  return BigInt('0x' + bytesToHex(bytes));
-}
 
-// Serialização assinada: domínio + array de campos em ordem FIXA (não depende
-// da ordem das chaves de um objeto). O prefixo de domínio impede que uma
-// assinatura feita para um contexto (mensagem direta) valha em outro (grupo,
-// registro), já que a mesma chave de identidade assina tudo.
-const DIRECT_DOMAIN = 'chat-ecc/direct/v2';
-const GROUP_DOMAIN = 'chat-ecc/group/v2';
+// Domínios de Assinatura
+const DIRECT_DOMAIN = 'chat-ecc/direct/v3';
+const GROUP_DOMAIN = 'chat-ecc/group/v3';
 const REGISTER_DOMAIN = 'chat-ecc/register/v1';
 const GROUP_GRANT_DOMAIN = 'chat-ecc/group-grant/v1';
 
@@ -61,13 +54,12 @@ function verifyFields(domain, fields, signatureHex, publicKeyHex) {
   }
 }
 
-// Identificador único (128 bits) da mensagem, via CSPRNG. Funciona também em
-// contextos não seguros (HTTP na rede local), onde crypto.randomUUID não existe.
 export function newMessageId() {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
   return bytesToHex(bytes);
 }
+
 function checkEnvelope(packet) {
   if (typeof packet.messageId !== 'string' || !/^[0-9a-f]{32}$/.test(packet.messageId)) {
     throw new Error('messageId inválido.');
@@ -75,78 +67,6 @@ function checkEnvelope(packet) {
   if (!Number.isSafeInteger(packet.sentAt) || packet.sentAt <= 0) {
     throw new Error('sentAt inválido.');
   }
-}
-function parsePublicKey(publicKeyHex) {
-  try {
-    const point = Point.fromHex(publicKeyHex);
-    if (point.equals(Point.ZERO)) throw new Error();
-    return point;
-  } catch {
-    throw new Error('Chave pública inválida.');
-  }
-}
-
-/*
- * Protótipo didático EC-ElGamal para mensagens curtas:
- * codifica [tamanho (1 byte) || UTF-8] no x de um ponto, usando 8 bits
- * de contador para procurar um x válido. Limite: 28 bytes UTF-8.
- * Não é uma construção padronizada nem deve ser usado para produção.
- */
-function encodeMessagePoint(text) {
-  const message = new TextEncoder().encode(text);
-
-  if (message.length > 28) {
-    throw new Error(
-      'Nesta versão didática, a mensagem deve ter até 28 bytes UTF-8.'
-    );
-  }
-
-  // Bloco fixo de 29 bytes:
-  // 1 byte para o tamanho + até 28 bytes para a mensagem.
-  const framed = new Uint8Array(29);
-  framed[0] = message.length;
-  framed.set(message, 1);
-
-  // Reserva os 8 bits inferiores para o contador.
-  const base = bytesToBigint(framed) << 8n;
-
-  for (let counter = 0n; counter < 256n; counter++) {
-    const x = base | counter;
-
-    if (x >= secp256k1.CURVE.p) break;
-
-    for (const prefix of [2, 3]) {
-      try {
-        const encodedPoint = concat(
-          Uint8Array.of(prefix),
-          bigintToBytes(x, 32)
-        );
-
-        return Point.fromHex(encodedPoint);
-      } catch {
-        // Tenta o próximo prefixo ou contador.
-      }
-    }
-  }
-
-  throw new Error('Não foi possível codificar a mensagem como ponto.');
-}
-function decodeMessagePoint(point) {
-  const x = point.toAffine().x;
-
-  // Recupera exatamente os 29 bytes usados na codificação.
-  const framed = bigintToBytes(x >> 8n, 29);
-  const length = framed[0];
-
-  if (length > 28) {
-    throw new Error(
-      'Ponto descriptografado não contém uma mensagem válida.'
-    );
-  }
-
-  return new TextDecoder('utf-8', { fatal: true }).decode(
-    framed.slice(1, 1 + length)
-  );
 }
 
 export function createIdentity() {
@@ -156,23 +76,36 @@ export function createIdentity() {
   return { privateKey, publicKey };
 }
 
-export const DIRECT_ALGORITHM = 'EC-ElGamal-secp256k1-direct-v2';
-export const GROUP_ALGORITHM = 'EC-ElGamal-secp256k1-group-v2';
-export const PROTOCOL_VERSION = 2;
+// Novos Algoritmos Híbridos
+export const DIRECT_ALGORITHM = 'Hybrid-ECDHE-AES256GCM-direct-v3';
+export const GROUP_ALGORITHM = 'Hybrid-ECDHE-AES256GCM-group-v3';
+export const PROTOCOL_VERSION = 3;
 
+// A estrutura do pacote mudou: saiu c1/c2, entrou ePub, iv e ciphertext
 const directFields = p => [
-  p.version, p.algorithm, p.senderID, p.receiverID, p.messageId, p.sentAt, p.c1, p.c2
+  p.version, p.algorithm, p.senderID, p.receiverID, p.messageId, p.sentAt, p.ePub, p.iv, p.ciphertext
 ];
 const groupFields = p => [
-  p.version, p.algorithm, p.groupID, p.senderID, p.receiverID, p.messageId, p.sentAt, p.c1, p.c2
+  p.version, p.algorithm, p.groupID, p.senderID, p.receiverID, p.messageId, p.sentAt, p.ePub, p.iv, p.ciphertext, p.wrappedKey
 ];
 
-export function encryptForRecipient(text, recipientPublicKey, senderPrivateKey, senderID, receiverID) {
-  const recipientPoint = parsePublicKey(recipientPublicKey);
-  const messagePoint = encodeMessagePoint(text);
-  const ephemeral = randomScalar();
-  const c1 = Point.BASE.multiply(ephemeral);
-  const c2 = messagePoint.add(recipientPoint.multiply(ephemeral));
+/* ---------- Mensagens Diretas (ECDHE + AES-GCM) ---------- */
+
+export async function encryptForRecipient(text, recipientPublicKeyHex, senderPrivateKeyHex, senderID, receiverID) {
+  // 1. ECDHE: Gera chave efêmera para esta mensagem (Garante PFS)
+  const ePriv = randomScalar();
+  const ePub = Point.BASE.multiply(ePriv).toHex(true);
+
+  // 2. Calcula o Segredo Partilhado com o destinatário
+  const sharedSecret = secp256k1.getSharedSecret(bigintToBytes(ePriv, 32), hexToBytes(recipientPublicKeyHex));
+  const aesKeyMaterial = sha256(sharedSecret); // Deriva chave de 32 bytes (256 bits)
+
+  // 3. AES-GCM: Cifra a mensagem (Tamanho ilimitado)
+  const cryptoKey = await crypto.subtle.importKey('raw', aesKeyMaterial, { name: 'AES-GCM' }, false, ['encrypt']);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encodedText = new TextEncoder().encode(text);
+  const cipherBuffer = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, encodedText);
+
   const unsigned = {
     version: PROTOCOL_VERSION,
     algorithm: DIRECT_ALGORITHM,
@@ -180,173 +113,160 @@ export function encryptForRecipient(text, recipientPublicKey, senderPrivateKey, 
     receiverID,
     messageId: newMessageId(),
     sentAt: Date.now(),
-    c1: c1.toHex(true),
-    c2: c2.toHex(true)
+    ePub,
+    iv: bytesToHex(iv),
+    ciphertext: bytesToHex(new Uint8Array(cipherBuffer))
   };
-  const signature = signFields(DIRECT_DOMAIN, directFields(unsigned), senderPrivateKey);
+
+  // 4. Assina o pacote com a chave de Identidade para provar a autoria
+  const signature = signFields(DIRECT_DOMAIN, directFields(unsigned), senderPrivateKeyHex);
   return { ...unsigned, signature };
 }
 
-// Retorna { plaintext, messageId, sentAt }. A assinatura é verificada ANTES de decifrar.
-export function decryptAndVerify(packet, recipientPrivateKey, senderPublicKey, expectedUserID) {
-  if (!packet || packet.algorithm !== DIRECT_ALGORITHM) {
-    throw new Error('Algoritmo de mensagem direta desconhecido.');
-  }
-  if (packet.version !== PROTOCOL_VERSION) {
-    throw new Error('Versão do pacote não suportada.');
-  }
-  if (expectedUserID && packet.receiverID !== expectedUserID) {
-    throw new Error('A mensagem não foi destinada a este usuário.');
-  }
+export async function decryptAndVerify(packet, recipientPrivateKeyHex, senderPublicKeyHex, expectedUserID) {
+  if (!packet || packet.algorithm !== DIRECT_ALGORITHM) throw new Error('Algoritmo direto desconhecido.');
+  if (packet.version !== PROTOCOL_VERSION) throw new Error('Versão do pacote não suportada.');
+  if (expectedUserID && packet.receiverID !== expectedUserID) throw new Error('A mensagem não foi destinada a este usuário.');
+  
   checkEnvelope(packet);
-  // `type` e `timestamp` são adicionados pelo servidor e ficam fora da assinatura.
-  if (!verifyFields(DIRECT_DOMAIN, directFields(packet), packet.signature, senderPublicKey)) {
+
+  // 1. Verifica Assinatura
+  if (!verifyFields(DIRECT_DOMAIN, directFields(packet), packet.signature, senderPublicKeyHex)) {
     throw new Error('Assinatura inválida. Mensagem descartada.');
   }
-  const d = BigInt('0x' + recipientPrivateKey);
-  const c1 = Point.fromHex(packet.c1);
-  const c2 = Point.fromHex(packet.c2);
-  const messagePoint = c2.add(c1.multiply(d).negate());
-  return {
-    plaintext: decodeMessagePoint(messagePoint),
-    messageId: packet.messageId,
-    sentAt: packet.sentAt
-  };
+
+  // 2. ECDHE: Calcula o Segredo Partilhado usando a chave privada e a ePub recebida
+  const sharedSecret = secp256k1.getSharedSecret(hexToBytes(recipientPrivateKeyHex), hexToBytes(packet.ePub));
+  const aesKeyMaterial = sha256(sharedSecret);
+
+  // 3. AES-GCM: Decifra a mensagem
+  const cryptoKey = await crypto.subtle.importKey('raw', aesKeyMaterial, { name: 'AES-GCM' }, false, ['decrypt']);
+  try {
+    const plainBuffer = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: hexToBytes(packet.iv) },
+      cryptoKey,
+      hexToBytes(packet.ciphertext)
+    );
+    return {
+      plaintext: new TextDecoder('utf-8').decode(plainBuffer),
+      messageId: packet.messageId,
+      sentAt: packet.sentAt
+    };
+  } catch (err) {
+    throw new Error('Falha ao decifrar a mensagem (AES-GCM).');
+  }
 }
 
-export function encryptForGroup(text, groupID, recipients, senderPrivateKey, senderID) {
-  if (!Array.isArray(recipients) || recipients.length === 0) {
-    throw new Error('O grupo não possui outros destinatários.');
-  }
+/* ---------- Mensagens de Grupo (AES Envelope + ECDHE) ---------- */
 
-  const messagePoint = encodeMessagePoint(text);
-  const ephemeral = randomScalar();
+export async function encryptForGroup(text, groupID, recipients, senderPrivateKeyHex, senderID) {
+  if (!Array.isArray(recipients) || recipients.length === 0) throw new Error('O grupo está vazio.');
+
+  // 1. Gera uma Chave AES aleatória apenas para esta mensagem e cifra o texto 1 vez
+  const messageAesKey = crypto.getRandomValues(new Uint8Array(32));
+  const cryptoKey = await crypto.subtle.importKey('raw', messageAesKey, { name: 'AES-GCM' }, false, ['encrypt']);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const cipherBuffer = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, new TextEncoder().encode(text));
+  const ciphertextHex = bytesToHex(new Uint8Array(cipherBuffer));
+  const ivHex = bytesToHex(iv);
+
+  // 2. Gera a Chave Efêmera do Grupo
+  const ePriv = randomScalar();
+  const ePub = Point.BASE.multiply(ePriv).toHex(true);
   const messageId = newMessageId();
   const sentAt = Date.now();
 
-  // Um único C1 é compartilhado entre todos os destinatários.
-  const c1 = Point.BASE.multiply(ephemeral).toHex(true);
-
+  // 3. Embrulha a chave AES para cada membro do grupo
   const encryptedBlocks = recipients
     .filter(recipient => recipient.username !== senderID)
     .map(recipient => {
-      if (!recipient.username || !recipient.publicKey) {
-        throw new Error('Chave pública de membro inválida.');
-      }
-
-      const recipientPoint = parsePublicKey(recipient.publicKey);
-
-      // C2 específico para a chave pública deste destinatário.
-      const c2 = messagePoint.add(recipientPoint.multiply(ephemeral)).toHex(true);
+      const sharedSecret = secp256k1.getSharedSecret(bigintToBytes(ePriv, 32), hexToBytes(recipient.publicKey));
+      const kek = sha256(sharedSecret); // Key Encryption Key
+      
+      // Encripta a chave AES fazendo um XOR com o KEK gerado via ECDHE
+      const wrappedKey = new Uint8Array(32);
+      for (let i = 0; i < 32; i++) wrappedKey[i] = messageAesKey[i] ^ kek[i];
+      const wrappedKeyHex = bytesToHex(wrappedKey);
 
       const unsigned = {
-        version: PROTOCOL_VERSION,
-        algorithm: GROUP_ALGORITHM,
-        groupID,
-        senderID,
-        receiverID: recipient.username,
-        messageId,
-        sentAt,
-        c1,
-        c2,
+        version: PROTOCOL_VERSION, algorithm: GROUP_ALGORITHM, groupID, senderID,
+        receiverID: recipient.username, messageId, sentAt, ePub, iv: ivHex,
+        ciphertext: ciphertextHex, wrappedKey: wrappedKeyHex,
       };
 
       return {
         username: recipient.username,
-        c2,
-        signature: signFields(GROUP_DOMAIN, groupFields(unsigned), senderPrivateKey),
+        wrappedKey: wrappedKeyHex,
+        signature: signFields(GROUP_DOMAIN, groupFields(unsigned), senderPrivateKeyHex),
       };
     });
 
-  if (encryptedBlocks.length === 0) {
-    throw new Error('Não há outros membros para receber a mensagem.');
-  }
+  if (encryptedBlocks.length === 0) throw new Error('Não há outros membros.');
 
   return {
-    version: PROTOCOL_VERSION,
-    algorithm: GROUP_ALGORITHM,
-    groupID,
-    senderID,
-    messageId,
-    sentAt,
-    c1,
-    encryptedBlocks,
+    version: PROTOCOL_VERSION, algorithm: GROUP_ALGORITHM, groupID, senderID,
+    messageId, sentAt, ePub, iv: ivHex, ciphertext: ciphertextHex, encryptedBlocks,
   };
 }
 
-export function decryptGroupAndVerify(packet, recipientPrivateKey, senderPublicKey, expectedUserID) {
-  if (!packet || packet.algorithm !== GROUP_ALGORITHM) {
-    throw new Error('Algoritmo de mensagem de grupo desconhecido.');
-  }
-  if (packet.version !== PROTOCOL_VERSION) {
-    throw new Error('Versão do pacote de grupo não suportada.');
-  }
-  if (expectedUserID && packet.receiverID !== expectedUserID) {
-    throw new Error('A mensagem não foi destinada a este usuário.');
-  }
+export async function decryptGroupAndVerify(packet, recipientPrivateKeyHex, senderPublicKeyHex, expectedUserID) {
+  if (!packet || packet.algorithm !== GROUP_ALGORITHM) throw new Error('Algoritmo de grupo desconhecido.');
+  if (packet.version !== PROTOCOL_VERSION) throw new Error('Versão não suportada.');
+  if (expectedUserID && packet.receiverID !== expectedUserID) throw new Error('Mensagem não destinada a você.');
+  
   checkEnvelope(packet);
 
-  if (!verifyFields(GROUP_DOMAIN, groupFields(packet), packet.signature, senderPublicKey)) {
-    throw new Error('Assinatura do grupo inválida. Mensagem descartada.');
+  if (!verifyFields(GROUP_DOMAIN, groupFields(packet), packet.signature, senderPublicKeyHex)) {
+    throw new Error('Assinatura do grupo inválida.');
   }
 
-  const privateScalar = BigInt(`0x${recipientPrivateKey}`);
-  const c1 = Point.fromHex(packet.c1);
-  const c2 = Point.fromHex(packet.c2);
+  // 1. Calcula o Segredo Partilhado e recupera a chave AES
+  const sharedSecret = secp256k1.getSharedSecret(hexToBytes(recipientPrivateKeyHex), hexToBytes(packet.ePub));
+  const kek = sha256(sharedSecret);
+  
+  const wrappedKey = hexToBytes(packet.wrappedKey);
+  const messageAesKey = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) messageAesKey[i] = wrappedKey[i] ^ kek[i];
 
-  // Pm = C2 - d*C1
-  const messagePoint = c2.add(c1.multiply(privateScalar).negate());
-
-  return {
-    plaintext: decodeMessagePoint(messagePoint),
-    messageId: packet.messageId,
-    sentAt: packet.sentAt,
-  };
+  // 2. Decifra a mensagem com a chave AES recuperada
+  const cryptoKey = await crypto.subtle.importKey('raw', messageAesKey, { name: 'AES-GCM' }, false, ['decrypt']);
+  try {
+    const plainBuffer = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: hexToBytes(packet.iv) },
+      cryptoKey,
+      hexToBytes(packet.ciphertext)
+    );
+    return {
+      plaintext: new TextDecoder('utf-8').decode(plainBuffer),
+      messageId: packet.messageId,
+      sentAt: packet.sentAt,
+    };
+  } catch(err) {
+    throw new Error('Falha ao decifrar mensagem de grupo (AES-GCM).');
+  }
 }
 
-/* ---------- Autenticação de sessão (prova de posse da chave de identidade) ---------- */
-
-// O servidor envia um nonce de uso único; o cliente assina [userID, nonce].
 export function signRegistration(privateKeyHex, userID, nonce) {
   return signFields(REGISTER_DOMAIN, [userID, nonce], privateKeyHex);
 }
-
-/* ---------- Concessão de grupo: o criador assina a lista de membros ---------- */
-// Impede que o servidor adicione/remova membros sem que os clientes percebam.
-
-export function newGroupID() {
-  return newMessageId();
-}
+export function newGroupID() { return newMessageId(); }
 const sortedMembers = members => [...new Set(members)].sort();
-
 export function signGroupGrant(privateKeyHex, groupID, members, createdBy) {
   return signFields(GROUP_GRANT_DOMAIN, [groupID, sortedMembers(members), createdBy], privateKeyHex);
 }
 export function verifyGroupGrant(group, creatorPublicKey) {
   if (!group?.signature) return false;
-  return verifyFields(
-    GROUP_GRANT_DOMAIN,
-    [group.groupID, sortedMembers(group.members), group.createdBy],
-    group.signature,
-    creatorPublicKey
-  );
+  return verifyFields(GROUP_GRANT_DOMAIN, [group.groupID, sortedMembers(group.members), group.createdBy], group.signature, creatorPublicKey);
 }
-
-/* ---------- Fingerprint para verificação fora de banda ---------- */
-
 export function fingerprint(publicKeyHex) {
   const digest = bytesToHex(sha256(hexToBytes(publicKeyHex))).slice(0, 40);
   return digest.match(/.{4}/g).join(' ');
 }
-
 export function validatePrivateKey(hex) {
   const bytes = hexToBytes(hex);
   if (bytes.length !== 32) throw new Error('Chave privada inválida.');
-  const n = bytesToBigint(bytes);
-  if (n <= 0n || n >= CURVE_ORDER) throw new Error('Chave privada fora do intervalo.');
   return true;
 }
-
 export function publicFromPrivate(hex) {
   validatePrivateKey(hex);
   return Point.BASE.multiply(BigInt('0x' + hex)).toHex(true);

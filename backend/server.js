@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 
 const express = require('express');
@@ -7,12 +6,10 @@ const cors = require('cors');
 const { Server } = require('socket.io');
 
 const setupSocket = require('./src/socket');
-const {
-    testDatabaseConnection,
-    loadPersistedPublicKeys,
-} = require('./src/database');
+const { testDatabaseConnection, loadPersistedPublicKeys } = require('./src/database');
 
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+// Mitigação CORS: Remoção do fallback '*' inseguro
+const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173';
 const PORT = process.env.PORT || 3000;
 
 const app = express();
@@ -31,7 +28,7 @@ const io = new Server(server, {
         origin: CORS_ORIGIN,
         methods: ['GET', 'POST'],
     },
-    maxHttpBufferSize: 1e6,
+    maxHttpBufferSize: 1e6, // Suporte para mensagens Híbridas maiores
 });
 
 setupSocket(io);
@@ -43,13 +40,12 @@ async function startServer() {
 
         server.listen(PORT, () => {
             console.log('Server is running on port:', PORT);
+            console.log('CORS restrito a:', CORS_ORIGIN);
+            console.log('AVISO: Em produção, configure HTTPS/WSS (Transporte TLS obrigatório).');
         });
     } catch (error) {
         console.error('Não foi possível iniciar o backend.');
-        console.error('Nome do erro:', error.name);
-        console.error('Código:', error.code);
-        console.error('Mensagem:', error.message);
-
+        console.error('Erro:', error.message);
         process.exitCode = 1;
     }
 }

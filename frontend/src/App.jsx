@@ -1,30 +1,49 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  createIdentity,
-  publicFromPrivate,
-  validatePrivateKey,
-  signRegistration,
-  newGroupID,
-  signGroupGrant,
-  verifyGroupGrant,
-  fingerprint,
+  createIdentity, publicFromPrivate, validatePrivateKey, signRegistration,
+  newGroupID, signGroupGrant, verifyGroupGrant, fingerprint,
 } from './crypto';
 import { runCrypto } from './workerClient';
 import { saveIdentitySecurely, loadIdentitySecurely, hasSecureIdentity } from './vault';
 import { createSocket, emitAck } from './socket';
 import { pinKey, acceptNewKey, alreadySeen } from './keyring';
 
-const LOCAL_MESSAGES_PREFIX = 'chat-ecc.messages.v1:';
+const LOCAL_MESSAGES_PREFIX = 'chat-ecc.messages.v2:'; // Atualizado para nova versão encriptada
 
-function readLocalMessages(userID) {
-  if (!userID) return [];
+// Encriptação Local (Histórico Seguro)
+async function saveMessagesSecurely(userID, messages, password) {
+  try {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), { name: 'PBKDF2' }, false, ['deriveKey']);
+    const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, keyMaterial, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
+    const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(messages)));
+    
+    const payload = { salt: Array.from(salt), iv: Array.from(iv), data: Array.from(new Uint8Array(encrypted)) };
+    localStorage.setItem(`${LOCAL_MESSAGES_PREFIX}${userID}`, JSON.stringify(payload));
+  } catch (e) {
+    console.error('Erro ao cifrar mensagens locais:', e);
+  }
+}
 
+async function loadMessagesSecurely(userID, password) {
   try {
     const saved = localStorage.getItem(`${LOCAL_MESSAGES_PREFIX}${userID}`);
-    const messages = saved ? JSON.parse(saved) : [];
-
-    return Array.isArray(messages) ? messages : [];
-  } catch {
+    if (!saved) return [];
+    const payload = JSON.parse(saved);
+    if (Array.isArray(payload)) return payload; // Fallback temporário
+    
+    const salt = new Uint8Array(payload.salt);
+    const iv = new Uint8Array(payload.iv);
+    const data = new Uint8Array(payload.data);
+    
+    const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), { name: 'PBKDF2' }, false, ['deriveKey']);
+    const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, keyMaterial, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+    const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data);
+    
+    return JSON.parse(new TextDecoder().decode(decrypted));
+  } catch (e) {
+    console.error('Falha ao decifrar histórico local. Senha incorreta ou dados corrompidos.');
     return [];
   }
 }
@@ -35,9 +54,7 @@ function formatTime(timestamp) {
   if (Number.isNaN(date.getTime())) return '';
   const today = new Date();
   const isToday = date.toDateString() === today.toDateString();
-  if (isToday) {
-    return date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-  }
+  if (isToday) return date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
   return date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
 }
 
@@ -72,49 +89,34 @@ export default function App() {
 
   const identityRef = useRef(identity);
   const userRef = useRef(userID);
+  const vaultPasswordRef = useRef(vaultPassword);
+
+  useEffect(() => { identityRef.current = identity; }, [identity]);
+  useEffect(() => { userRef.current = userID; }, [userID]);
+  useEffect(() => { vaultPasswordRef.current = vaultPassword; }, [vaultPassword]);
 
   function rememberMessage(message) {
     const currentUserID = identityRef.current?.userID;
 
-    if (currentUserID) {
-      try {
-        const saved = readLocalMessages(currentUserID);
-        const key = item =>
-          `${item.type || 'direct'}:${item.groupID || ''}:${item.id}`;
-
-        const updated = [
-          ...saved.filter(item => key(item) !== key(message)),
-          message,
-        ];
-
-        localStorage.setItem(
-          `${LOCAL_MESSAGES_PREFIX}${currentUserID}`,
-          JSON.stringify(updated)
-        );
-      } catch (error) {
-        console.error('Não foi possível salvar o histórico local:', error);
-      }
-    }
-
     setMessages(previous => {
-      const key = item =>
-        `${item.type || 'direct'}:${item.groupID || ''}:${item.id}`;
-
+      const key = item => `${item.type || 'direct'}:${item.groupID || ''}:${item.id}`;
+      let updated;
+      
       if (previous.some(item => key(item) === key(message))) {
-        return previous.map(item =>
-          key(item) === key(message) ? { ...item, ...message } : item
-        );
+        updated = previous.map(item => key(item) === key(message) ? { ...item, ...message } : item);
+      } else {
+        updated = [...previous, message];
       }
 
-      return [...previous, message];
+      if (currentUserID && vaultPasswordRef.current) {
+        saveMessagesSecurely(currentUserID, updated, vaultPasswordRef.current);
+      }
+      return updated;
     });
   }
 
   const targetRef = useRef(target);
   const messageListRef = useRef(null);
-
-  useEffect(() => { identityRef.current = identity; }, [identity]);
-  useEffect(() => { userRef.current = userID; }, [userID]);
   useEffect(() => { targetRef.current = target; }, [target]);
 
   const conversations = useMemo(() => {
@@ -149,16 +151,9 @@ export default function App() {
   const activeMessages = useMemo(() => {
     const filteredMessages = activeGroupID
       ? messages.filter(message => message.groupID === activeGroupID)
-      : messages.filter(
-          message => !message.groupID && message.peer === target
-        );
+      : messages.filter(message => !message.groupID && message.peer === target);
 
-    return [...filteredMessages].sort((a, b) => {
-      const timeA = Number(a.timestamp) || 0;
-      const timeB = Number(b.timestamp) || 0;
-
-      return timeA - timeB;
-    });
+    return [...filteredMessages].sort((a, b) => (Number(a.timestamp) || 0) - (Number(b.timestamp) || 0));
   }, [messages, target, activeGroupID]);
 
   useEffect(() => {
@@ -170,6 +165,7 @@ export default function App() {
     socket.on('connect', () => setStatus('Conectado'));
     socket.on('disconnect', () => setStatus('Desconectado'));
     socket.on('connect_error', err => setNotice(`Falha de conexão: ${err.message}`));
+    // Vazamento de usuários mitigado no backend (recebe array restrito ou vazio)
     socket.on('user_list_update', list => {
       setUsers(Array.isArray(list) ? list.filter(id => id !== userRef.current) : []);
     });
@@ -190,21 +186,12 @@ export default function App() {
       try {
         await Promise.all(
           (packets || []).map(packet =>
-            packet.type === 'group'
-              ? handleIncomingGroup(packet, true)
-              : handleIncoming(packet, true)
+            packet.type === 'group' ? handleIncomingGroup(packet, true) : handleIncoming(packet, true)
           )
         );
-
-        if (typeof ack === 'function') {
-          ack({ success: true });
-        }
+        if (typeof ack === 'function') ack({ success: true });
       } catch (error) {
-        console.error('Erro ao processar mensagens pendentes:', error);
-
-        if (typeof ack === 'function') {
-          ack({ success: false });
-        }
+        if (typeof ack === 'function') ack({ success: false });
       }
     });
 
@@ -221,7 +208,8 @@ export default function App() {
       const id = await loadIdentitySecurely(vaultPassword);
       setIdentity(id);
       setUserID(id.userID);
-      setMessages(readLocalMessages(id.userID));
+      const msgs = await loadMessagesSecurely(id.userID, vaultPassword);
+      setMessages(msgs);
       setIsLocked(false);
       setNotice('Cofre desbloqueado. Identidade carregada.');
     } catch (error) {
@@ -247,16 +235,16 @@ export default function App() {
     if (!response.success) throw new Error(response.message || 'Registro recusado.');
 
     const next = { ...ident, userID: normalizedID };
-    
     await saveIdentitySecurely(next, password);
     
     setIdentity(next);
     identityRef.current = next;
     setUserID(normalizedID);
     userRef.current = normalizedID;
-    setMessages(readLocalMessages(normalizedID));
+    
+    const msgs = await loadMessagesSecurely(normalizedID, password);
+    setMessages(msgs);
     setIsLocked(false);
-
     setNotice('Identidade registrada e guardada em segurança no cofre local.');
   }
 
@@ -277,7 +265,7 @@ export default function App() {
     try {
       const id = userID.trim();
       if (!id) throw new Error('Informe o identificador antes de gerar a identidade.');
-      if (!vaultPassword || vaultPassword.length < 3) throw new Error('Crie uma palavra-passe (min. 3 caracteres) para o cofre.');
+      if (!vaultPassword || vaultPassword.length < 3) throw new Error('Crie uma palavra-passe (min. 3 caracteres).');
 
       await ensureConnected();
       const ident = createIdentity();
@@ -306,7 +294,6 @@ export default function App() {
     setBusy(true);
     try {
       if (!vaultPassword || vaultPassword.length < 4) throw new Error('Crie uma palavra-passe forte para o cofre.');
-      
       const privateKey = privateImport.trim().toLowerCase();
       validatePrivateKey(privateKey);
       
@@ -331,12 +318,8 @@ export default function App() {
       setNotice(`Primeiro contato com "${peerID}". Confirme que o fingerprint é: ${fingerprint(res.publicKey)}`);
     } else if (pin.status === 'changed') {
       const accept = window.confirm(
-        `ATENÇÃO: A chave pública de "${peerID}" mudou!\n\n` +
-        `Pode ser um ataque (MITM) ou o utilizador reinstalou a aplicação e gerou uma nova chave.\n\n` +
-        `Novo Fingerprint: ${fingerprint(res.publicKey)}\n\n` +
-        `Aceitar nova chave?`
+        `ATENÇÃO: A chave pública de "${peerID}" mudou!\n\nPode ser um ataque ou o utilizador reinstalou a aplicação.\n\nNovo Fingerprint: ${fingerprint(res.publicKey)}\n\nAceitar nova chave?`
       );
-      
       if (accept) {
         acceptNewKey(peerID, res.publicKey);
       } else {
@@ -373,62 +356,39 @@ export default function App() {
   async function handleIncoming(packet, queued = false, fromHistory = false) {
     try {
       const me = identityRef.current;
-
       if (!me || packet.receiverID !== me.userID) {
-        if (queued) {
-          throw new Error(
-            'Destinatário da mensagem direta inválido ou identidade indisponível.'
-          );
-        }
-
+        if (queued) throw new Error('Destinatário inválido.');
         return;
       }
 
+      // Verificação de Frescor (Replay protection) mitigada: ±5 minutos
+      if (Math.abs(Date.now() - packet.sentAt) > 300000) {
+          throw new Error('Carimbo de tempo expirado (Possível ataque de replay).');
+      }
+
       const senderKey = await getPeerKey(packet.senderID);
+      const { plaintext, messageId, sentAt } = await runCrypto('decryptAndVerify', packet, me.privateKey, senderKey, me.userID);
 
-      const { plaintext, messageId, sentAt } = await runCrypto(
-        'decryptAndVerify', packet, me.privateKey, senderKey, me.userID
-      );
-
-      // No histórico, a deduplicação é feita pelo identificador da mensagem.
       if (!fromHistory && alreadySeen(messageId)) return;
 
-      rememberMessage({
-        id: messageId,
-        direction: 'in',
-        peer: packet.senderID,
-        text: plaintext,
-        timestamp: sentAt,
-        queued,
-      });
+      rememberMessage({ id: messageId, direction: 'in', peer: packet.senderID, text: plaintext, timestamp: sentAt, queued });
     } catch (error) {
-      setNotice(`Mensagem recebida rejeitada: ${error.message}`);
+      setNotice(`Mensagem rejeitada: ${error.message}`);
       if (queued) throw error;
     }
   }
 
   async function loadConversationHistory(peerID) {
     const me = identityRef.current;
-
     if (!me || !peerID || !socket.connected) return;
 
     try {
       const response = await emitAck(socket, 'request_direct_history', { peerID });
-
-      if (!response.success) {
-        throw new Error(response.message || 'Falha ao carregar o histórico.');
-      }
-
+      if (!response.success) throw new Error(response.message || 'Falha ao carregar o histórico.');
       const history = Array.isArray(response.messages) ? response.messages : [];
 
       for (const packet of history) {
-        // Mensagens recebidas podem ser descriptografadas neste dispositivo.
-        if (packet.receiverID === me.userID) {
-          await handleIncoming(packet, false, true);
-        }
-
-        // Mensagens enviadas são restauradas do armazenamento local.
-        // O servidor possui somente o pacote cifrado para o destinatário.
+        if (packet.receiverID === me.userID) await handleIncoming(packet, false, true);
       }
     } catch (error) {
       setNotice(`Erro ao carregar histórico: ${error.message}`);
@@ -438,34 +398,27 @@ export default function App() {
   async function handleIncomingGroup(packet, isPending = false) {
     try {
       const me = identityRef.current;
-
       if (!me || packet.receiverID !== me.userID) {
-        if (isPending) {
-          throw new Error(
-            'Destinatário da mensagem de grupo inválido ou identidade indisponível.'
-          );
-        }
-
+        if (isPending) throw new Error('Destinatário de grupo inválido.');
         return;
       }
 
-      const senderKey = await getPeerKey(packet.senderID);
+      if (Math.abs(Date.now() - packet.sentAt) > 300000) {
+          throw new Error('Mensagem de grupo expirada.');
+      }
 
-      const { plaintext, messageId, sentAt } = await runCrypto(
-        'decryptGroupAndVerify', packet, me.privateKey, senderKey, me.userID
-      );
+      // Conferir filiação do remetente
+      const group = groups.find(g => g.groupID === packet.groupID);
+      if (group && !group.members.includes(packet.senderID)) {
+          throw new Error('Remetente intruso detectado fora da lista de membros do grupo.');
+      }
+
+      const senderKey = await getPeerKey(packet.senderID);
+      const { plaintext, messageId, sentAt } = await runCrypto('decryptGroupAndVerify', packet, me.privateKey, senderKey, me.userID);
 
       if (alreadySeen(`${packet.groupID}:${messageId}`)) return;
 
-      rememberMessage({
-        id: messageId,
-        type: 'group',
-        groupID: packet.groupID,
-        peer: packet.senderID,
-        direction: 'in',
-        text: plaintext,
-        timestamp: sentAt,
-      });
+      rememberMessage({ id: messageId, type: 'group', groupID: packet.groupID, peer: packet.senderID, direction: 'in', text: plaintext, timestamp: sentAt });
     } catch (error) {
       setNotice(`Mensagem de grupo rejeitada: ${error.message}`);
       throw error;
@@ -476,9 +429,7 @@ export default function App() {
     event.preventDefault();
     if (activeGroupID) {
       setBusy(true);
-      try { await sendGroupMessage(); } 
-      catch (error) { setNotice(error.message); } 
-      finally { setBusy(false); }
+      try { await sendGroupMessage(); } catch (error) { setNotice(error.message); } finally { setBusy(false); }
       return;
     }
 
@@ -492,24 +443,14 @@ export default function App() {
       if (!draft.trim()) throw new Error('Digite uma mensagem.');
 
       const recipientKey = await getPeerKey(recipient);
-
-      const packet = await runCrypto(
-        'encryptForRecipient', draft, recipientKey, me.privateKey, me.userID, recipient
-      );
+      const packet = await runCrypto('encryptForRecipient', draft, recipientKey, me.privateKey, me.userID, recipient);
 
       const response = await emitAck(socket, 'send_encrypted_message', packet);
       if (!response.success) throw new Error(response.message || 'Envio recusado.');
 
-      rememberMessage({
-        id: packet.messageId,
-        direction: 'out',
-        peer: recipient,
-        text: draft,
-        timestamp: packet.sentAt,
-      });
-
+      rememberMessage({ id: packet.messageId, direction: 'out', peer: recipient, text: draft, timestamp: packet.sentAt });
       setDraft('');
-      setNotice(response.delivered ? 'Mensagem cifrada encaminhada.' : 'Mensagem armazenada na fila offline.');
+      setNotice(response.delivered ? 'Mensagem encaminhada.' : 'Mensagem armazenada na fila offline.');
     } catch (error) {
       setNotice(error.message);
     } finally {
@@ -530,25 +471,14 @@ export default function App() {
       if(pin.status === 'changed') acceptNewKey(item.username, item.publicKey); 
     }
 
-    const encryptedPacket = await runCrypto(
-      'encryptForGroup', draft, group.groupID, group.groupKeys, me.privateKey, me.userID
-    );
-
+    const encryptedPacket = await runCrypto('encryptForGroup', draft, group.groupID, group.groupKeys, me.privateKey, me.userID);
     const response = await emitAck(socket, 'send_group_encrypted_message', encryptedPacket);
-    if (!response.success) throw new Error(response.message || 'Envio da mensagem de grupo recusado.');
+    
+    if (!response.success) throw new Error(response.message || 'Envio recusado.');
 
-    rememberMessage({
-      id: encryptedPacket.messageId,
-      type: 'group',
-      groupID: group.groupID,
-      peer: me.userID,
-      direction: 'out',
-      text: draft,
-      timestamp: encryptedPacket.sentAt,
-    });
-
+    rememberMessage({ id: encryptedPacket.messageId, type: 'group', groupID: group.groupID, peer: me.userID, direction: 'out', text: draft, timestamp: encryptedPacket.sentAt });
     setDraft('');
-    setNotice(`Mensagem de grupo encaminhada. Entregues: ${response.delivered || 0}; fila: ${response.queued || 0}; falhas: ${response.failed || 0}.`);
+    setNotice(`Mensagem de grupo encaminhada.`);
   }
 
   async function createGroup(event) {
@@ -563,19 +493,14 @@ export default function App() {
       const newID = newGroupID();
 
       const response = await emitAck(socket, 'create_group', {
-        groupID: newID,
-        members: allMembers,
-        signature: signGroupGrant(me.privateKey, newID, allMembers, me.userID),
+        groupID: newID, members: allMembers, signature: signGroupGrant(me.privateKey, newID, allMembers, me.userID),
       });
 
       if (!response.success) throw new Error(response.message || 'Não foi possível criar o grupo.');
 
-      const newGroup = {
-        groupID: response.groupID, members: response.members, groupKeys: response.groupKeys,
-        createdBy: response.createdBy || me.userID, signature: response.signature,
-      };
+      const newGroup = { groupID: response.groupID, members: response.members, groupKeys: response.groupKeys, createdBy: response.createdBy || me.userID, signature: response.signature };
 
-      if (!acceptGroup(newGroup)) throw new Error('O servidor devolveu um grupo inconsistente.');
+      if (!acceptGroup(newGroup)) throw new Error('Grupo inconsistente.');
 
       setGroups(prev => [...prev.filter(g => g.groupID !== newGroup.groupID), newGroup]);
       setTarget('');
@@ -583,7 +508,7 @@ export default function App() {
       setActiveGroupID(newGroup.groupID);
       setGroupID(newGroup.groupID);
       setGroupMembers('');
-      setNotice(`Grupo criado com ${newGroup.members.length} participantes.`);
+      setNotice(`Grupo criado.`);
     } catch (error) {
       setNotice(error.message);
     } finally {
@@ -592,10 +517,7 @@ export default function App() {
   }
 
   function openConversation(id) {
-    setActiveGroupID('');
-    setTarget(id);
-    targetRef.current = id;
-
+    setActiveGroupID(''); setTarget(id); targetRef.current = id;
     loadConversationHistory(id);
   }
   function openGroup(grpID) {
@@ -616,23 +538,19 @@ export default function App() {
       {notice && (
         <div className="notice" role="status">
           <span>{notice}</span>
-          <button className="icon-button" onClick={() => setNotice('')} aria-label="Fechar aviso">×</button>
+          <button className="icon-button" onClick={() => setNotice('')}>×</button>
         </div>
       )}
 
       <section className="panel identity-panel">
         <div className="section-heading">
-          <div>
-            <span className="eyebrow">ETAPA 01</span>
-            <h2>Sua identidade</h2>
-          </div>
+          <div><span className="eyebrow">ETAPA 01</span><h2>Sua identidade</h2></div>
           <span className="pill">AES-GCM Local · secp256k1</span>
         </div>
 
         {isLocked ? (
           <form onSubmit={unlockVault} className="identity-grid">
-            <label>
-              Cofre local encontrado. Introduza a palavra-passe:
+            <label>Cofre local encontrado. Introduza a palavra-passe:
               <input type="password" value={vaultPassword} onChange={e => setVaultPassword(e.target.value)} placeholder="Palavra-passe do cofre" />
             </label>
             <div className="button-row">
@@ -643,7 +561,7 @@ export default function App() {
           <>
             <div className="identity-grid" style={{marginBottom: "15px"}}>
               <label>Identificador de usuário<input value={userID} onChange={e => setUserID(e.target.value)} placeholder="ex.: alice" maxLength={128} /></label>
-              <label>Criar palavra-passe para o Cofre (Local)<input type="password" value={vaultPassword} onChange={e => setVaultPassword(e.target.value)} placeholder="Mínimo 3 caracteres" /></label>
+              <label>Criar palavra-passe para o Cofre<input type="password" value={vaultPassword} onChange={e => setVaultPassword(e.target.value)} placeholder="Mínimo 3 caracteres" /></label>
             </div>
             <div className="button-row">
               <button onClick={createNewIdentity} disabled={busy || !userID.trim() || vaultPassword.length < 3}>Gerar identidade encriptada</button>
@@ -651,18 +569,15 @@ export default function App() {
             
             <details className="import-details">
               <summary>Importar chave privada existente</summary>
-              <label>Chave privada hexadecimal (32 bytes)<input value={privateImport} onChange={e => setPrivateImport(e.target.value)} placeholder="64 caracteres hexadecimais" autoComplete="off" /></label>
+              <label>Chave privada hexadecimal<input value={privateImport} onChange={e => setPrivateImport(e.target.value)} placeholder="64 caracteres hexadecimais" autoComplete="off" /></label>
               <button className="secondary" onClick={importIdentity} disabled={busy || !privateImport.trim() || vaultPassword.length < 3}>Importar para o cofre</button>
             </details>
           </>
         ) : (
           <div className="key-card">
             <div><span className="key-label">Identidade local</span><strong>{identity.userID || userID}</strong></div>
-            <div><span className="key-label">Chave pública</span><code>{identity.publicKey}</code></div>
-            <div><span className="key-label">Fingerprint (confira com seus contatos)</span><code>{fingerprint(identity.publicKey)}</code></div>
-            <p>
-              A sua chave privada está armazenada em segurança, encriptada com a sua palavra-passe usando AES-GCM (Proteção XSS).
-            </p>
+            <div><span className="key-label">Fingerprint (confirme com seus contatos)</span><code>{fingerprint(identity.publicKey)}</code></div>
+            <p>A sua chave e histórico estão protegidos usando AES-GCM (Proteção contra XSS e exfiltração física).</p>
             <button className="secondary" onClick={reconnect} disabled={busy}>Reconectar Sessão</button>
           </div>
         )}
@@ -675,26 +590,16 @@ export default function App() {
               <div><span className="eyebrow">MENSAGENS</span><h2>Conversas</h2></div>
               <span className="count">{conversations.length}</span>
             </div>
-
             <div className="conversation-search">
               <span aria-hidden="true">⌕</span>
               <input type="search" value={conversationSearch} onChange={e => setConversationSearch(e.target.value)} placeholder="Buscar conversas..." />
             </div>
-
             <div className="conversation-list">
               {filteredConversations.length > 0 ? (
                 filteredConversations.map(conversation => {
                   const lastMessage = conversation.lastMessage;
-                  let preview = conversation.online ? 'Online agora' : 'Nenhuma mensagem ainda';
-                  if (lastMessage) {
-                    if (lastMessage.queued && lastMessage.direction === 'in') {
-                      preview = `Mensagem recebida: ${lastMessage.text}`;
-                    } else if (lastMessage.direction === 'out') {
-                      preview = `Você: ${lastMessage.text}`;
-                    } else {
-                      preview = lastMessage.text;
-                    }
-                  }
+                  let preview = conversation.online ? 'Online agora' : 'Nenhuma mensagem';
+                  if (lastMessage) preview = lastMessage.direction === 'out' ? `Você: ${lastMessage.text}` : lastMessage.text;
 
                   return (
                     <button type="button" key={conversation.id} className={`conversation-item ${target === conversation.id ? 'active' : ''}`} onClick={() => openConversation(conversation.id)}>
@@ -703,17 +608,13 @@ export default function App() {
                         <span className={`presence-dot ${conversation.online ? 'is-online' : ''}`} />
                       </span>
                       <span className="conversation-copy">
-                        <span className="conversation-topline"><strong title={conversation.id}>{conversation.id}</strong><span className="conversation-time">{lastMessage ? formatTime(lastMessage.timestamp) : ''}</span></span>
+                        <span className="conversation-topline"><strong>{conversation.id}</strong><span className="conversation-time">{lastMessage ? formatTime(lastMessage.timestamp) : ''}</span></span>
                         <span className="conversation-preview">{preview}</span>
                       </span>
                     </button>
                   );
                 })
-              ) : (
-                <div className="conversation-empty">
-                  <p>Nenhuma conversa por enquanto.</p>
-                </div>
-              )}
+              ) : (<div className="conversation-empty"><p>Nenhuma conversa.</p></div>)}
             </div>
           </section>
 
@@ -732,7 +633,7 @@ export default function App() {
                   </li>
                 ))}
               </ul>
-            ) : (<p className="muted">Nenhum outro usuário conectado.</p>)}
+            ) : (<p className="muted">Exibição global de rede desativada por privacidade.</p>)}
           </section>
 
           <section className="panel group-panel">
@@ -754,7 +655,7 @@ export default function App() {
               </div>
             )}
             <form onSubmit={createGroup}>
-              <label>IDs dos membros separados por vírgula<input value={groupMembers} onChange={e => setGroupMembers(e.target.value)} placeholder="bob, carol" /></label>
+              <label>IDs separados por vírgula<input value={groupMembers} onChange={e => setGroupMembers(e.target.value)} placeholder="bob, carol" /></label>
               <button className="secondary full-width" disabled={busy || !groupMembers.trim()}>Criar grupo</button>
             </form>
           </section>
@@ -767,35 +668,24 @@ export default function App() {
                 <span className="conversation-avatar chat-header-avatar group-avatar">G</span>
                 <div className="chat-header-copy">
                   <h2>{groups.find(g => g.groupID === activeGroupID) ? `Grupo ${activeGroupID.slice(0, 8)}` : 'Grupo'}</h2>
-                  <span>{groups.find(g => g.groupID === activeGroupID)?.members.length || 0} participantes · mensagens criptografadas</span>
+                  <span>{groups.find(g => g.groupID === activeGroupID)?.members.length || 0} participantes</span>
                 </div>
               </>
             ) : target ? (
               <>
-                <span className="conversation-avatar chat-header-avatar">
-                  {target.slice(0, 1).toUpperCase()}
-                </span>
-                <div className="chat-header-copy">
-                  <h2>{target}</h2>
-                </div>
+                <span className="conversation-avatar chat-header-avatar">{target.slice(0, 1).toUpperCase()}</span>
+                <div className="chat-header-copy"><h2>{target}</h2></div>
               </>
             ) : (
-              <div className="chat-header-copy">
-                <h2>Mensagens diretas</h2>
-                <span>Selecione uma conversa para começar</span>
-              </div>
+              <div className="chat-header-copy"><h2>Mensagens diretas</h2><span>Selecione uma conversa para começar</span></div>
             )}
           </div>
 
           <div className="message-list" ref={messageListRef}>
             {!target && !activeGroupID ? (
-              <div className="empty-state">
-                <p>Suas conversas em um só lugar.</p>
-              </div>
+              <div className="empty-state"><p>Suas conversas em um só lugar.</p></div>
             ) : activeMessages.length === 0 ? (
-              <div className="empty-state">
-                <p>Nenhuma mensagem ainda.</p>
-              </div>
+              <div className="empty-state"><p>Nenhuma mensagem ainda.</p></div>
             ) : (
               activeMessages.map(message => (
                 <article key={message.id} className={`message ${message.direction}`}>
@@ -807,17 +697,9 @@ export default function App() {
           </div>
 
           <form className="composer" onSubmit={sendMessage}>
-            <textarea
-              value={draft}
-              onChange={e => setDraft(e.target.value)}
-              placeholder="Digite uma mensagem "
-              rows={3}
-              disabled={(!target && !activeGroupID) || busy || isLocked}
-            />
+            <textarea value={draft} onChange={e => setDraft(e.target.value)} placeholder="Digite uma mensagem " rows={3} disabled={(!target && !activeGroupID) || busy || isLocked} />
             <div className="composer-footer">
-              <button disabled={busy || (!target && !activeGroupID) || !draft.trim() || isLocked}>
-                Cifrar e enviar ↗
-              </button>
+              <button disabled={busy || (!target && !activeGroupID) || !draft.trim() || isLocked}>Cifrar e enviar ↗</button>
             </div>
           </form>
         </section>

@@ -14,6 +14,21 @@ import { saveIdentitySecurely, loadIdentitySecurely, hasSecureIdentity } from '.
 import { createSocket, emitAck } from './socket';
 import { pinKey, acceptNewKey, alreadySeen } from './keyring';
 
+const LOCAL_MESSAGES_PREFIX = 'chat-ecc.messages.v1:';
+
+function readLocalMessages(userID) {
+  if (!userID) return [];
+
+  try {
+    const saved = localStorage.getItem(`${LOCAL_MESSAGES_PREFIX}${userID}`);
+    const messages = saved ? JSON.parse(saved) : [];
+
+    return Array.isArray(messages) ? messages : [];
+  } catch {
+    return [];
+  }
+}
+
 function formatTime(timestamp) {
   if (!timestamp) return '';
   const date = new Date(timestamp);
@@ -57,6 +72,44 @@ export default function App() {
 
   const identityRef = useRef(identity);
   const userRef = useRef(userID);
+
+  function rememberMessage(message) {
+    const currentUserID = identityRef.current?.userID;
+
+    if (currentUserID) {
+      try {
+        const saved = readLocalMessages(currentUserID);
+        const key = item =>
+          `${item.type || 'direct'}:${item.groupID || ''}:${item.id}`;
+
+        const updated = [
+          ...saved.filter(item => key(item) !== key(message)),
+          message,
+        ];
+
+        localStorage.setItem(
+          `${LOCAL_MESSAGES_PREFIX}${currentUserID}`,
+          JSON.stringify(updated)
+        );
+      } catch (error) {
+        console.error('Não foi possível salvar o histórico local:', error);
+      }
+    }
+
+    setMessages(previous => {
+      const key = item =>
+        `${item.type || 'direct'}:${item.groupID || ''}:${item.id}`;
+
+      if (previous.some(item => key(item) === key(message))) {
+        return previous.map(item =>
+          key(item) === key(message) ? { ...item, ...message } : item
+        );
+      }
+
+      return [...previous, message];
+    });
+  }
+
   const targetRef = useRef(target);
   const messageListRef = useRef(null);
 
@@ -94,8 +147,18 @@ export default function App() {
   }, [conversations, conversationSearch]);
 
   const activeMessages = useMemo(() => {
-    if (activeGroupID) return messages.filter(msg => msg.groupID === activeGroupID);
-    return messages.filter(msg => !msg.groupID && msg.peer === target);
+    const filteredMessages = activeGroupID
+      ? messages.filter(message => message.groupID === activeGroupID)
+      : messages.filter(
+          message => !message.groupID && message.peer === target
+        );
+
+    return [...filteredMessages].sort((a, b) => {
+      const timeA = Number(a.timestamp) || 0;
+      const timeB = Number(b.timestamp) || 0;
+
+      return timeA - timeB;
+    });
   }, [messages, target, activeGroupID]);
 
   useEffect(() => {
@@ -123,12 +186,26 @@ export default function App() {
       if (!acceptGroup(groupData)) return;
       setGroups(prev => [...prev.filter(g => g.groupID !== groupData.groupID), groupData]);
     });
-    socket.on('pending_messages', (packets, ack) => {
-      Promise.all(
-        (packets || []).map(packet =>
-          packet.type === 'group' ? handleIncomingGroup(packet, true) : handleIncoming(packet, true)
-        )
-      ).finally(() => { if (typeof ack === 'function') ack(); });
+    socket.on('pending_messages', async (packets, ack) => {
+      try {
+        await Promise.all(
+          (packets || []).map(packet =>
+            packet.type === 'group'
+              ? handleIncomingGroup(packet, true)
+              : handleIncoming(packet, true)
+          )
+        );
+
+        if (typeof ack === 'function') {
+          ack({ success: true });
+        }
+      } catch (error) {
+        console.error('Erro ao processar mensagens pendentes:', error);
+
+        if (typeof ack === 'function') {
+          ack({ success: false });
+        }
+      }
     });
 
     return () => {
@@ -144,6 +221,7 @@ export default function App() {
       const id = await loadIdentitySecurely(vaultPassword);
       setIdentity(id);
       setUserID(id.userID);
+      setMessages(readLocalMessages(id.userID));
       setIsLocked(false);
       setNotice('Cofre desbloqueado. Identidade carregada.');
     } catch (error) {
@@ -176,6 +254,7 @@ export default function App() {
     identityRef.current = next;
     setUserID(normalizedID);
     userRef.current = normalizedID;
+    setMessages(readLocalMessages(normalizedID));
     setIsLocked(false);
 
     setNotice('Identidade registrada e guardada em segurança no cofre local.');
@@ -291,10 +370,19 @@ export default function App() {
     }
   }
 
-  async function handleIncoming(packet, queued = false) {
+  async function handleIncoming(packet, queued = false, fromHistory = false) {
     try {
       const me = identityRef.current;
-      if (!me || packet.receiverID !== me.userID) return;
+
+      if (!me || packet.receiverID !== me.userID) {
+        if (queued) {
+          throw new Error(
+            'Destinatário da mensagem direta inválido ou identidade indisponível.'
+          );
+        }
+
+        return;
+      }
 
       const senderKey = await getPeerKey(packet.senderID);
 
@@ -302,20 +390,64 @@ export default function App() {
         'decryptAndVerify', packet, me.privateKey, senderKey, me.userID
       );
 
-      if (alreadySeen(messageId)) return;
+      // No histórico, a deduplicação é feita pelo identificador da mensagem.
+      if (!fromHistory && alreadySeen(messageId)) return;
 
-      setMessages(prev => [...prev, {
-        id: messageId, direction: 'in', peer: packet.senderID, text: plaintext, timestamp: sentAt, queued
-      }]);
+      rememberMessage({
+        id: messageId,
+        direction: 'in',
+        peer: packet.senderID,
+        text: plaintext,
+        timestamp: sentAt,
+        queued,
+      });
     } catch (error) {
       setNotice(`Mensagem recebida rejeitada: ${error.message}`);
+      if (queued) throw error;
     }
   }
 
-  async function handleIncomingGroup(packet) {
+  async function loadConversationHistory(peerID) {
+    const me = identityRef.current;
+
+    if (!me || !peerID || !socket.connected) return;
+
+    try {
+      const response = await emitAck(socket, 'request_direct_history', { peerID });
+
+      if (!response.success) {
+        throw new Error(response.message || 'Falha ao carregar o histórico.');
+      }
+
+      const history = Array.isArray(response.messages) ? response.messages : [];
+
+      for (const packet of history) {
+        // Mensagens recebidas podem ser descriptografadas neste dispositivo.
+        if (packet.receiverID === me.userID) {
+          await handleIncoming(packet, false, true);
+        }
+
+        // Mensagens enviadas são restauradas do armazenamento local.
+        // O servidor possui somente o pacote cifrado para o destinatário.
+      }
+    } catch (error) {
+      setNotice(`Erro ao carregar histórico: ${error.message}`);
+    }
+  }
+
+  async function handleIncomingGroup(packet, isPending = false) {
     try {
       const me = identityRef.current;
-      if (!me || packet.receiverID !== me.userID) return;
+
+      if (!me || packet.receiverID !== me.userID) {
+        if (isPending) {
+          throw new Error(
+            'Destinatário da mensagem de grupo inválido ou identidade indisponível.'
+          );
+        }
+
+        return;
+      }
 
       const senderKey = await getPeerKey(packet.senderID);
 
@@ -325,11 +457,18 @@ export default function App() {
 
       if (alreadySeen(`${packet.groupID}:${messageId}`)) return;
 
-      setMessages(prev => [...prev, {
-        id: messageId, type: 'group', groupID: packet.groupID, peer: packet.senderID, direction: 'in', text: plaintext, timestamp: sentAt
-      }]);
+      rememberMessage({
+        id: messageId,
+        type: 'group',
+        groupID: packet.groupID,
+        peer: packet.senderID,
+        direction: 'in',
+        text: plaintext,
+        timestamp: sentAt,
+      });
     } catch (error) {
       setNotice(`Mensagem de grupo rejeitada: ${error.message}`);
+      throw error;
     }
   }
 
@@ -362,9 +501,14 @@ export default function App() {
       const response = await emitAck(socket, 'send_encrypted_message', packet);
       if (!response.success) throw new Error(response.message || 'Envio recusado.');
 
-      setMessages(prev => [...prev, {
-        id: packet.messageId, direction: 'out', peer: recipient, text: draft, timestamp: packet.sentAt
-      }]);
+      rememberMessage({
+        id: packet.messageId,
+        direction: 'out',
+        peer: recipient,
+        text: draft,
+        timestamp: packet.sentAt,
+      });
+
       setDraft('');
       setNotice(response.delivered ? 'Mensagem cifrada encaminhada.' : 'Mensagem armazenada na fila offline.');
     } catch (error) {
@@ -395,9 +539,16 @@ export default function App() {
     const response = await emitAck(socket, 'send_group_encrypted_message', encryptedPacket);
     if (!response.success) throw new Error(response.message || 'Envio da mensagem de grupo recusado.');
 
-    setMessages(prev => [...prev, {
-      id: encryptedPacket.messageId, type: 'group', groupID: group.groupID, peer: me.userID, direction: 'out', text: draft, timestamp: encryptedPacket.sentAt
-    }]);
+    rememberMessage({
+      id: encryptedPacket.messageId,
+      type: 'group',
+      groupID: group.groupID,
+      peer: me.userID,
+      direction: 'out',
+      text: draft,
+      timestamp: encryptedPacket.sentAt,
+    });
+
     setDraft('');
     setNotice(`Mensagem de grupo encaminhada. Entregues: ${response.delivered || 0}; fila: ${response.queued || 0}; falhas: ${response.failed || 0}.`);
   }
@@ -443,7 +594,11 @@ export default function App() {
   }
 
   function openConversation(id) {
-    setActiveGroupID(''); setTarget(id); targetRef.current = id;
+    setActiveGroupID('');
+    setTarget(id);
+    targetRef.current = id;
+
+    loadConversationHistory(id);
   }
   function openGroup(grpID) {
     setTarget(''); targetRef.current = ''; setActiveGroupID(grpID);
@@ -534,8 +689,13 @@ export default function App() {
                   const lastMessage = conversation.lastMessage;
                   let preview = conversation.online ? 'Online agora' : 'Nenhuma mensagem ainda';
                   if (lastMessage) {
-                    preview = lastMessage.direction === 'out' ? `Você: ${lastMessage.text}` : lastMessage.text;
-                    if (lastMessage.queued) preview = `Mensagem recebida: ${lastMessage.text}`;
+                    if (lastMessage.queued && lastMessage.direction === 'in') {
+                      preview = `Mensagem recebida: ${lastMessage.text}`;
+                    } else if (lastMessage.direction === 'out') {
+                      preview = `Você: ${lastMessage.text}`;
+                    } else {
+                      preview = lastMessage.text;
+                    }
                   }
 
                   return (
